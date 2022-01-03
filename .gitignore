@@ -1,0 +1,4 @@
+sip-processor/.stack-work
+sip-processor/.stack-work/
+sip-processor/.gitignore
+*.lock
