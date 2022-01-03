@@ -1,8 +1,12 @@
 sip-processor/.stack-work
 sip-processor/.stack-work/
 sip-processor/.gitignore
-*.lock
-RemoteIO-app/target/*
-RemoteIO-app/target
+sip-processor/c-bind/*
+sip-processor/c-bind
 sip-processor/dist/*
 sip-processor/dist
+RemoteIO-app/target/*
+RemoteIO-app/target
+RemoteIO-app/c-src/*_stub.h
+RemoteIO-app/c-src/*.so
+*.lock
