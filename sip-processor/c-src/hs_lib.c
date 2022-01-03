@@ -1,3 +1,4 @@
+//https://www.vex.net/~trebla/haskell/so.xhtml
 #include <HsFFI.h>
 
 static void my_enter(void) __attribute__((constructor));
