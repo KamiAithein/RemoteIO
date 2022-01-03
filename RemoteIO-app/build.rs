@@ -43,16 +43,6 @@ fn move_library(/*_name: &str, _dir_from: &str, _dir_to: &str*/) -> std::io::Res
             .args(["Lib_stub.h", "../../RemoteIO-app/c-src/Lib_stub.h"])
             .output()
             .expect("could not move dynamic library!");
-    
-    let stub = File::open("c-src/Lib_stub.h")?;
-    let stub_reader = BufReader::new(stub);
-
-    let mut stub_act = File::create("c-src/Lib_stub_act.h")?;
-
-    for line_res in stub_reader.lines().skip(1) {
-        stub_act.write_all(line_res?.as_bytes())?;
-        write!(stub_act, "\n");
-    }
 
     return Ok(());
 }
