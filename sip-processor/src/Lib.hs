@@ -1,6 +1,6 @@
-module Lib
-    ( someFunc
-    ) where
+module Lib where
 
-someFunc :: IO ()
-someFunc = putStrLn "Hello World"
+import Foreign.C.Types
+
+foreign export ccall helloFromHaskell :: IO ()
+helloFromHaskell = putStrLn "Hello World!"
