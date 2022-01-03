@@ -36,6 +36,7 @@ executables:
     dependencies:
     - sip-processor
 
+
 tests:
   sip-processor-test:
     main:                Spec.hs

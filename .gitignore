@@ -4,3 +4,5 @@ sip-processor/.gitignore
 *.lock
 RemoteIO-app/target/*
 RemoteIO-app/target
+sip-processor/dist/*
+sip-processor/dist

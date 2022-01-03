@@ -1,0 +1,2 @@
+int helloFromHaskell();
+int jomamaFromHaskell();
