@@ -10,4 +10,6 @@ bindgen = "0.59.2"
 
 [dependencies]
 bindgen = "0.59.2"
-
+cpal = "0.13.4"
+ringbuf = "0.2.6"
+rand = "0.8.4"
