@@ -1,15 +1,35 @@
 [package]
-name = "RemoteIO-app"
+name = "eframe_template"
 version = "0.1.0"
+authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]
 edition = "2021"
+rust-version = "1.56"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[build-dependencies]
-bindgen = "0.59.2"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bindgen = "0.59.2"
+eframe = "0.16.0" # Gives us egui, epi and web+native backends
+
+serde = { version = "1", features = ["derive"], optional = true }
+
+remoteio_core = {path = "RemoteIO-core"}
+
 cpal = "0.13.4"
-ringbuf = "0.2.6"
-rand = "0.8.4"
+
+[features]
+default = []
+persistence = ["eframe/persistence", "serde"] # Enable if you want to persist app state on shutdown
+
+[profile.release]
+opt-level = 2 # fast and small wasm
+
+[patch.crates-io]
+
+# If you want to use the bleeding edge version of `egui`:
+# eframe = { git = "https://github.com/emilk/egui", branch = "master" }
+
+# If you fork https://github.com/emilk/egui you can test with:
+# eframe = { path = "../egui/eframe" }

@@ -1,9 +1,8 @@
-pub mod devicecoordinator;
-
 use std::error::Error;
 use ringbuf::RingBuffer;
-use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+use crate::audio::streams::device::Device;
 
 pub struct DeviceForwarder {
     pub source: Device,

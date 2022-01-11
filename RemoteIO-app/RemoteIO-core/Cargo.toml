@@ -1,0 +1,19 @@
+[package]
+name = "remoteio_core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "remoteio_core"
+path = "src/lib.rs"
+
+[build-dependencies]
+bindgen = "0.59.2"
+
+[dependencies]
+bindgen = "0.59.2"
+cpal = "0.13.4"
+ringbuf = "0.2.6"
+rand = "0.8.4"
