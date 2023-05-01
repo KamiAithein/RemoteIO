@@ -105,29 +105,54 @@ async fn obtain_input_device() -> Result<(cpal::SupportedStreamConfig, cpal::Dev
 }
 
 
+struct Client {
+    audio_link: AudioLink
+}
 
+impl Client {
+    pub async fn new(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+        // first get config of this device
+        let (config, input_device) = obtain_input_device().await?;
+
+        // then get connection
+        let connection = Connection::new(url, config).await?;
+
+        // create stream where every float is send to the server
+        let audio_link = AudioLink::new(connection, &input_device).await?;
+
+        audio_link.stream.play().unwrap();
+
+        return Ok(Client {
+            audio_link
+        });
+    }
+
+    pub async fn next_message(&mut self) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+        match self.audio_link.reader.next().await {
+            None => Ok(None),
+            Some(res) => 
+                match res {
+                    Ok(msg) => Ok(Some(msg)),
+                    Err(e) => panic!("when trying to get next message from audio_link, got: {}", e)
+                }
+        }
+    }
+}
 
 
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
-    // first get config of this device
-    let (config, input_device) = obtain_input_device().await?;
 
-    // then get connection
     let url = "ws://127.0.0.1:8000";
-    let connection = Connection::new(url, config).await?;
+    
+    let mut client = Client::new(url).await?;
 
-    // create stream where every float is send to the server
-    let mut audio_link = AudioLink::new(connection, &input_device).await?;
-
-    audio_link.stream.play().unwrap();
-
-    while let Some(Ok(msg)) = audio_link.reader.next().await {
+    while let Ok(Some(msg)) = client.next_message().await {
         println!("Received message: {}", msg);
     }
+    
 
     Ok(())
 }
