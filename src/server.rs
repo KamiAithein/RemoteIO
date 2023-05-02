@@ -2,8 +2,9 @@ use std::convert::TryInto;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc};
 use axum::Router;
+use axum::extract::{Path, State};
 use axum::routing::get;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::net::TcpStream;
 
 
@@ -19,23 +20,22 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use futures::{FutureExt, StreamExt};
 
-fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl AsyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     
-    let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
+    // need to turn audio_data_stream to sync by rewriting AsyncAudioStream as SyncAudioStream
+    // let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
     
     let audio_stream = output_device
     .build_output_stream(
         &config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
 
-            runtime.block_on(async {
-                let next = audio_data_stream.get_next_batch().await.expect("couldnt get next value!");
+            let next = audio_data_stream.get_next_batch().expect("couldnt get next value!");
 
-                for (d, f) in data.into_iter().zip(next.iter()) {
-                    
-                    *d = f.clone();
-                }
-            });
+            for (d, f) in data.into_iter().zip(next.iter()) {
+                
+                *d = f.clone();
+            }
 
 
         },
@@ -49,6 +49,10 @@ fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl AsyncAu
     return Ok(audio_stream);
 }
 
+
+trait SyncAudioStream {
+    fn get_next_batch(&mut self) -> Option<Vec<f32>>;
+}
 
 #[async_trait]
 trait AsyncAudioStream {
@@ -72,7 +76,11 @@ impl RealOutputDevice {
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 runtime.block_on(async {
+
+                    println!("Acquiring lock!! {}", line!());
                     let mut buffer = buffer_rx.lock().await;
+                    println!("Acquired lock!! {}", line!());
+
 
                     buffer.append(&mut data.to_vec());
                 });
@@ -99,7 +107,10 @@ impl RealOutputDevice {
 #[async_trait]
 impl AsyncAudioStream for RealOutputDevice {
     async fn get_next_batch(&mut self) -> Option<Vec<f32>> {
+        println!("Acquiring lock {}", line!());
         let mut buffer = self.buffer.lock().await;
+        println!("Acquired lock!! {}", line!());
+
         if buffer.len() == 0 {
             return None;
         }
@@ -124,6 +135,50 @@ impl VirtualOutputDevice {
     }
 }
 
+
+impl SyncAudioStream for VirtualOutputDevice {
+    fn get_next_batch(&mut self) -> Option<Vec<f32>> {
+        let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
+
+        let next_message = runtime.block_on(async { 
+            self.websocket
+                .next()
+                .await
+        });
+
+            if let Some(Ok(message)) = next_message {
+
+                let mut buffer = self.buffer.blocking_lock();
+                
+                let mut message_data = 
+                    message.into_data()
+                                .chunks(4)
+                                .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("couldnt turn chunk into slice")))
+                                .collect::<Vec<f32>>();
+                
+                buffer.append(&mut message_data);
+
+                buffer.reverse();
+                buffer.truncate(1024);
+                buffer.reverse();
+            }
+
+            let mut buffer = self.buffer.blocking_lock();
+
+            if buffer.len() == 0 {
+                println!("buffer is empty from asyncaudiostream!");
+                return None;
+            }
+
+            let clone = buffer.clone();
+            buffer.clear();
+
+            return Some(clone);
+        // })
+
+        
+    }
+}
 #[async_trait]
 impl AsyncAudioStream for VirtualOutputDevice {
     async fn get_next_batch(&mut self) -> Option<Vec<f32>> {
@@ -134,7 +189,10 @@ impl AsyncAudioStream for VirtualOutputDevice {
 
         if let Some(Ok(message)) = next_message {
 
+            println!("Acquiring lock {}", line!());
             let mut buffer = self.buffer.lock().await;
+            println!("Acquired lock!! {}", line!());
+
             
             let mut message_data = 
                 message.into_data()
@@ -149,7 +207,10 @@ impl AsyncAudioStream for VirtualOutputDevice {
             buffer.reverse();
         }
 
+        println!("Acquiring lock {}", line!());
         let mut buffer = self.buffer.lock().await;
+        println!("Acquired lock!! {}", line!());
+
 
         if buffer.len() == 0 {
             println!("buffer is empty from asyncaudiostream!");
@@ -167,9 +228,11 @@ impl AsyncAudioStream for VirtualOutputDevice {
 struct Client {
     name: String
 }
-struct State {
+struct ProgramState {
     clients: Arc<Mutex<Vec<Client>>>
 }
+
+type AudioState = std::collections::HashMap<String, cpal::Stream>;
 
 impl Client {
     pub async fn new(stream: TcpStream) -> Result<(Client, cpal::Stream), Box<dyn std::error::Error>> {
@@ -204,32 +267,43 @@ impl Client {
     } 
 }
 
-async fn audio_link_listener(program_state: Arc<Mutex<State>>, audio_state: Arc<Mutex<Vec<cpal::Stream>>>) -> Result<(), Box<dyn std::error::Error>> {
+//this is a sort of black magic as to why it doesn't deadlock
+async fn acquire_locks2<'t1, 't2, T1, T2>(l1: &'t1 Arc<Mutex<T1>>, l2: &'t2 Arc<Mutex<T2>>) -> (MutexGuard<'t1, T1>, MutexGuard<'t2, T2>) {
+    return (l1.lock().await, l2.lock().await);
+}
+
+async fn audio_link_listener(program_state: Arc<ProgramState>, audio_state: Arc<Mutex<AudioState>>) -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:8000";
     let listener = TcpListener::bind(addr).await.unwrap();
     println!("Listening on: {}", addr);
     
-    while let Ok((stream, _)) = listener.accept().await {
+    while let Ok((tcp_stream, _)) = listener.accept().await {
+        let name = tcp_stream.peer_addr().unwrap().to_string();
             
-        let (client, stream) = Client::new(stream).await?;
+        let (client, stream) = Client::new(tcp_stream).await?;
 
-        let ul_state = program_state.lock().await;
-        let mut ul_clients = ul_state.clients.lock().await;
+        let (mut ul_clients, mut ul_audio_state) = acquire_locks2(&program_state.clients, &audio_state).await;
+        
         ul_clients.push(client);
-
-        let mut ul_audio_state = audio_state.lock().await;
-        ul_audio_state.push(stream);
+        ul_audio_state.insert(name, stream);
     }
 
     Ok(())
 }
 
-async fn audio_link_control(program_state: Arc<Mutex<State>>, audio_state: Arc<Mutex<Vec<cpal::Stream>>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_link_control(program_state: Arc<ProgramState>, audio_state: Arc<Mutex<AudioState>>) -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
-        let ul_streams = audio_state.lock().await;
-        let ul_state = program_state.lock().await;
-        let ul_clients = ul_state.clients.lock().await;
+
+        let (ul_clients, mut ul_streams) = acquire_locks2(&program_state.clients, &audio_state).await;
+
+        let names = ul_clients.iter().map(|client| client.name.clone() ).collect::<Vec<String>>();
+        let to_pauses = ul_streams.keys().map(|k| k.to_owned() ).filter(|key| !names.contains(key)).collect::<Vec<String>>();
+        
+        for to_pause in to_pauses {
+            // ul_streams.get(&to_pause).unwrap().pause()?;
+            ul_streams.remove(&to_pause);
+        }
 
         // at this point we need to compare clients to streams to see if something needs to be removed
         // it would be easier if streams was a kv mapping and clients contained the name key
@@ -239,9 +313,9 @@ async fn audio_link_control(program_state: Arc<Mutex<State>>, audio_state: Arc<M
     Ok(())
 }
 
-async fn audio_link_main(state: Arc<Mutex<State>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_link_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
 
-    let mut streams = Arc::new(Mutex::new(vec![]));
+    let mut streams = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let listener_state = Arc::clone(&state);
     let listener_streams = Arc::clone(&streams);
@@ -249,7 +323,10 @@ async fn audio_link_main(state: Arc<Mutex<State>>) -> Result<(), Box<dyn std::er
     let control_state = Arc::clone(&state);
     let control_streams = Arc::clone(&streams);
 
+    // audio stream creator / destroyer signal generator
     let listener_future = audio_link_listener(listener_state, listener_streams);
+
+    // creator / destroyer signal handler
     let control_future = audio_link_control(control_state, control_streams);
 
     let _ = futures::join!(listener_future, control_future);
@@ -258,9 +335,11 @@ async fn audio_link_main(state: Arc<Mutex<State>>) -> Result<(), Box<dyn std::er
     
 }
 
-async fn pop(state: Arc<Mutex<State>>) -> String {
-    let ul_state = state.lock().await;
-    let mut ul_clients = ul_state.clients.lock().await;
+async fn pop(State(state): State<Arc<ProgramState>>) -> String {
+    println!("Acquiring lock {}", line!());
+    let mut ul_clients = state.clients.lock().await;
+    println!("Acquired lock!! {}", line!());
+
 
     return match ul_clients.pop() {
         Some(value) => format!("received {}", value.name),
@@ -268,9 +347,21 @@ async fn pop(state: Arc<Mutex<State>>) -> String {
     };
 }
 
-async fn list(state: Arc<Mutex<State>>) -> String {
-    let ul_state = state.lock().await;
-    let ul_clients = ul_state.clients.lock().await;
+async fn pop_client(State(state): State<Arc<ProgramState>>, Path(client_name): Path<String>) -> String {
+    let mut ul_clients = state.clients.lock().await;
+
+    let i = ul_clients.iter().map(|client| client.name.clone()).position(|name| name == client_name);
+    match i {
+        Some(i) => ul_clients.remove(i).name,
+        None => format!("could not find {client_name}")
+    }
+    
+}
+
+async fn list(State(state): State<Arc<ProgramState>>) -> String {
+    println!("Acquiring lock {}", line!());
+    let ul_clients = state.clients.lock().await;
+    println!("Acquired lock!! {}", line!());
 
     let clients = ul_clients
         .iter()
@@ -285,13 +376,14 @@ async fn list(state: Arc<Mutex<State>>) -> String {
     }
 }
 
-async fn audio_control_main(state: Arc<Mutex<State>>) -> Result<(), Box<dyn std::error::Error>> {
-    let pop_state = Arc::clone(&state);
-    let list_state = Arc::clone(&state);
+async fn audio_control_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
+
     
     let app = Router::new()
-        .route("/pop", get(move || pop(pop_state)))
-        .route("/list", get(move || list(list_state)));
+        .route("/pop", get(pop))
+        .route("/pop/:client_name", get(pop_client))
+        .route("/list", get(list))
+        .with_state(state);
 
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
@@ -301,18 +393,20 @@ async fn audio_control_main(state: Arc<Mutex<State>>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[tokio::main(worker_threads = 4)]
+#[tokio::main]
 async fn main() {
 
-    let state: Arc<Mutex<State>> = Arc::new(Mutex::new(State{clients: Arc::new(Mutex::new(vec![]))}));
+    let state: Arc<ProgramState> = Arc::new(ProgramState{clients: Arc::new(Mutex::new(vec![]))});
 
     let audio_link_state = Arc::clone(&state);
     let audio_control_state = Arc::clone(&state);
     
-    // Cannot move Stream between threads. Need to think of another way
+    // Links audio devices
     let audio_link_future = audio_link_main(audio_link_state);
+
+    // allows user to manipulate audio devices
     let audio_control_future = audio_control_main(audio_control_state);
 
-    let _ = futures::join!(audio_link_future, audio_control_future);
+    let _ = futures::join!(audio_control_future, audio_link_future);
     
 }
