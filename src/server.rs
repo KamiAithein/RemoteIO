@@ -20,10 +20,9 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use futures::{FutureExt, StreamExt};
 
+
+// Creates a cpal audio stream pulling from some SyncAudioStream
 fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-    
-    // need to turn audio_data_stream to sync by rewriting AsyncAudioStream as SyncAudioStream
-    // let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
     
     let audio_stream = output_device
     .build_output_stream(
@@ -76,11 +75,7 @@ impl RealOutputDevice {
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 runtime.block_on(async {
-
-                    println!("Acquiring lock!! {}", line!());
                     let mut buffer = buffer_rx.lock().await;
-                    println!("Acquired lock!! {}", line!());
-
 
                     buffer.append(&mut data.to_vec());
                 });
@@ -107,9 +102,7 @@ impl RealOutputDevice {
 #[async_trait]
 impl AsyncAudioStream for RealOutputDevice {
     async fn get_next_batch(&mut self) -> Option<Vec<f32>> {
-        println!("Acquiring lock {}", line!());
         let mut buffer = self.buffer.lock().await;
-        println!("Acquired lock!! {}", line!());
 
         if buffer.len() == 0 {
             return None;
@@ -166,7 +159,7 @@ impl SyncAudioStream for VirtualOutputDevice {
             let mut buffer = self.buffer.blocking_lock();
 
             if buffer.len() == 0 {
-                println!("buffer is empty from asyncaudiostream!");
+                println!("buffer is empty from syncaudiostream!");
                 return None;
             }
 
@@ -189,9 +182,7 @@ impl AsyncAudioStream for VirtualOutputDevice {
 
         if let Some(Ok(message)) = next_message {
 
-            println!("Acquiring lock {}", line!());
             let mut buffer = self.buffer.lock().await;
-            println!("Acquired lock!! {}", line!());
 
             
             let mut message_data = 
@@ -207,9 +198,7 @@ impl AsyncAudioStream for VirtualOutputDevice {
             buffer.reverse();
         }
 
-        println!("Acquiring lock {}", line!());
         let mut buffer = self.buffer.lock().await;
-        println!("Acquired lock!! {}", line!());
 
 
         if buffer.len() == 0 {
@@ -298,15 +287,12 @@ async fn audio_link_control(program_state: Arc<ProgramState>, audio_state: Arc<M
         let (ul_clients, mut ul_streams) = acquire_locks2(&program_state.clients, &audio_state).await;
 
         let names = ul_clients.iter().map(|client| client.name.clone() ).collect::<Vec<String>>();
-        let to_pauses = ul_streams.keys().map(|k| k.to_owned() ).filter(|key| !names.contains(key)).collect::<Vec<String>>();
+        let to_removes = ul_streams.keys().map(|k| k.to_owned() ).filter(|key| !names.contains(key)).collect::<Vec<String>>();
         
-        for to_pause in to_pauses {
+        for to_remove in to_removes {
             // ul_streams.get(&to_pause).unwrap().pause()?;
-            ul_streams.remove(&to_pause);
+            ul_streams.remove(&to_remove);
         }
-
-        // at this point we need to compare clients to streams to see if something needs to be removed
-        // it would be easier if streams was a kv mapping and clients contained the name key
         
     }
 
@@ -336,9 +322,7 @@ async fn audio_link_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::er
 }
 
 async fn pop(State(state): State<Arc<ProgramState>>) -> String {
-    println!("Acquiring lock {}", line!());
     let mut ul_clients = state.clients.lock().await;
-    println!("Acquired lock!! {}", line!());
 
 
     return match ul_clients.pop() {
@@ -359,9 +343,7 @@ async fn pop_client(State(state): State<Arc<ProgramState>>, Path(client_name): P
 }
 
 async fn list(State(state): State<Arc<ProgramState>>) -> String {
-    println!("Acquiring lock {}", line!());
     let ul_clients = state.clients.lock().await;
-    println!("Acquired lock!! {}", line!());
 
     let clients = ul_clients
         .iter()
