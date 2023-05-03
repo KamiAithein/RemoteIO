@@ -38,7 +38,7 @@ impl Connection {
      }
 
      async fn send_client_config(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-        let bin_config_struct = remoteio::BinStreamConfig {
+        let bin_config_struct = remoteio_backend::BinStreamConfig {
             channels:  connection.config.channels(),
             sample_rate: connection.config.sample_rate().0,
             buffer_size: 4096
@@ -144,10 +144,9 @@ impl Client {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    let url = "ws://127.0.0.1:8000";
+    let config = &remoteio_shared::config;
     
-    let mut client = Client::new(url).await?;
+    let mut client = Client::new(&config.ws_endpoint).await?;
 
     while let Ok(Some(msg)) = client.next_message().await {
         println!("Received message: {}", msg);

@@ -236,7 +236,7 @@ impl Client {
         let config_message = virtual_device.websocket.next().await.expect("couldnt get config message!").expect("couldnt get config message!");
         let config_data = config_message.into_data();
 
-        let config_des: remoteio::BinStreamConfig = bincode::deserialize(&config_data).expect("couldnt deserialize message!");
+        let config_des: remoteio_backend::BinStreamConfig = bincode::deserialize(&config_data).expect("couldnt deserialize message!");
         let config = cpal::StreamConfig {
             channels: config_des.channels,
             sample_rate: cpal::SampleRate(config_des.sample_rate), // Audio device default sample rate is set to 192000
@@ -262,9 +262,10 @@ async fn acquire_locks2<'t1, 't2, T1, T2>(l1: &'t1 Arc<Mutex<T1>>, l2: &'t2 Arc<
 }
 
 async fn audio_link_listener(program_state: Arc<ProgramState>, audio_state: Arc<Mutex<AudioState>>) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:8000";
-    let listener = TcpListener::bind(addr).await.unwrap();
-    println!("Listening on: {}", addr);
+    let config = &remoteio_shared::config;
+
+    let listener = TcpListener::bind(&config.server_endpoint).await.unwrap();
+    println!("Listening on: {}", &config.server_endpoint);
     
     while let Ok((tcp_stream, _)) = listener.accept().await {
         let name = tcp_stream.peer_addr().unwrap().to_string();
@@ -359,7 +360,7 @@ async fn list(State(state): State<Arc<ProgramState>>) -> String {
 }
 
 async fn audio_control_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
-
+    let config = &remoteio_shared::config;
     
     let app = Router::new()
         .route("/pop", get(pop))
@@ -367,7 +368,7 @@ async fn audio_control_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std:
         .route("/list", get(list))
         .with_state(state);
 
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+    axum::Server::bind(&config.rest_endpoint.parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
