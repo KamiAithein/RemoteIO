@@ -24,6 +24,11 @@ function App() {
     await invoke("pop", { name });
   }
 
+  async function connect(wsAddr) {
+    console.log("what the fuck");
+    await invoke("connect", { wsAddr });
+  }
+
   useEffect(() => {
     getList()
 
@@ -49,7 +54,10 @@ function App() {
           ))}
         </div>
         <div label="Client">
-          After 'while, Crocodile
+          <button 
+            onClick={(e) => {
+              connect("ws://0.0.0.0:8000");
+              }}>ws://0.0.0.0:8000</button>
         </div>
       </Tabs>
     </div>

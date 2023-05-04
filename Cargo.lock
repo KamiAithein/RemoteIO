@@ -915,12 +915,14 @@ dependencies = [
 name = "frontend"
 version = "0.0.0"
 dependencies = [
+ "remoteio-backend",
  "remoteio-shared",
  "reqwest",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]

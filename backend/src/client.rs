@@ -38,7 +38,7 @@ impl Connection {
      }
 
      async fn send_client_config(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-        let bin_config_struct = remoteio_backend::BinStreamConfig {
+        let bin_config_struct = crate::BinStreamConfig {
             channels:  connection.config.channels(),
             sample_rate: connection.config.sample_rate().0,
             buffer_size: 4096
@@ -105,9 +105,12 @@ async fn obtain_input_device() -> Result<(cpal::SupportedStreamConfig, cpal::Dev
 }
 
 
-struct Client {
+pub struct Client {
     audio_link: AudioLink
 }
+
+// my first step into unsafe. Fuck.
+unsafe impl core::marker::Send for Client {}
 
 impl Client {
     pub async fn new(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
@@ -142,16 +145,16 @@ impl Client {
 
 
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = &remoteio_shared::config;
+// #[tokio::main]
+// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//     let config = &remoteio_shared::config;
     
-    let mut client = Client::new(&config.ws_endpoint).await?;
+//     let mut client = Client::new(&config.ws_endpoint).await?;
 
-    while let Ok(Some(msg)) = client.next_message().await {
-        println!("Received message: {}", msg);
-    }
+//     while let Ok(Some(msg)) = client.next_message().await {
+//         println!("Received message: {}", msg);
+//     }
     
 
-    Ok(())
-}
+//     Ok(())
+// }

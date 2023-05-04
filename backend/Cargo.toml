@@ -19,9 +19,5 @@ axum = "0.6.18"
 remoteio-shared = { path = "../shared" }
 
 [[bin]]
-name = "client"
-path = "src/client.rs"
-
-[[bin]]
 name = "server"
 path = "src/server.rs"
