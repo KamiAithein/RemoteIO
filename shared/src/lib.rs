@@ -9,8 +9,8 @@ pub struct RemoteIOConfig {
 }
 
 pub static config: RemoteIOConfig  = RemoteIOConfig {
-    rest_endpoint: "http://0.0.0.0:3000",
-    server_endpoint: "http://0.0.0.0:8000",
+    rest_endpoint: "0.0.0.0:3000",
+    server_endpoint: "0.0.0.0:8000",
     ws_endpoint: "ws://0.0.0.0:8000"
 
 };

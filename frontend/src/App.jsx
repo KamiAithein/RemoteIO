@@ -1,12 +1,14 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/tauri";
 import "./App.css";
 
+import Tabs from "./components/Tabs"
+
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
-  const [list, setList] = useState("");
+  const [list, setList] = useState(["default"]);
 
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
@@ -14,14 +16,42 @@ function App() {
   }
 
   async function getList() {
-    setList(await invoke("list"));
+    let list = await invoke("list");
+    setList(list);
   }
 
+  async function pop(name) {
+    await invoke("pop", { name });
+  }
+
+  useEffect(() => {
+    getList()
+
+    const intervalId = setInterval(() => {
+      getList();
+    }, 5000);
+
+    return () => clearInterval(intervalId);
+  }, []);
+
   return (
-    <div className="container">
+    <div>
       <h1>Welcome to RemoteIO!</h1>
-      <button class="submit" onClick={(e) => getList()}>Hello</button>
-      <p>{list}</p>
+      <Tabs>
+        <div label="Server">
+          {list.map((item, index) => (
+            <div>
+              <button>{item}</button>
+              <button onClick={(e)=>{
+                pop(item);
+              }}>remove</button>
+            </div>
+          ))}
+        </div>
+        <div label="Client">
+          After 'while, Crocodile
+        </div>
+      </Tabs>
     </div>
   );
 }

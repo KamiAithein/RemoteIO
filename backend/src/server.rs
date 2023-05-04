@@ -343,19 +343,18 @@ async fn pop_client(State(state): State<Arc<ProgramState>>, Path(client_name): P
     
 }
 
-async fn list(State(state): State<Arc<ProgramState>>) -> String {
+async fn list(State(state): State<Arc<ProgramState>>) -> axum::Json<Vec<String>> {
     let ul_clients = state.clients.lock().await;
 
     let clients = ul_clients
         .iter()
         .map(|client| client.name.clone())
-        .collect::<Vec<String>>()
-        .join(", ");
+        .collect::<Vec<String>>();
 
     if clients.is_empty() {
-        return "no clients!".to_string();
+        return axum::Json::from(vec![]);
     } else {
-        return clients;
+        return axum::Json::from(clients);
     }
 }
 
