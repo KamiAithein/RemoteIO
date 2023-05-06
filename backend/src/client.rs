@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::{convert::TryInto, slice::from_mut};
 
 use std::sync::{Arc, Mutex};
@@ -59,16 +60,23 @@ impl Connection {
         Ok(connection)
     }
 }
-
+#[derive(Clone)]
+pub enum AudioLinkStatus {
+    Alive,
+    Dead
+}
 struct AudioLink {
     stream: cpal::Stream,
-    reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>
+    reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    status: Arc<Mutex<AudioLinkStatus>>
 }
 
 impl AudioLink {
     async fn create_remote_audio_link(connection: Connection, input_device: &cpal::Device) -> Result<AudioLink, Box<dyn std::error::Error>> {
         let Connection { url, mut writer, reader, config } = connection;
-    
+        let status = Arc::new(Mutex::new(AudioLinkStatus::Alive));
+        let status_stream = Arc::clone(&status);
+
         let stream = input_device
             .build_input_stream(&config.into(), move |data: &[f32], _| {
                 let bytes = data.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
@@ -76,7 +84,13 @@ impl AudioLink {
                 let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
     
                 runtime.block_on(async {
-                    writer.send(Message::binary(bytes)).await.expect("couldnt send message!");
+                    match writer.send(Message::binary(bytes)).await {
+                        Ok(msg) => {},
+                        Err(e) => {
+                            let mut ul_status_stream = status_stream.lock().expect("couldn't lock status!");
+                            *ul_status_stream = AudioLinkStatus::Dead;
+                        }
+                    }
                 });
            
             }, |err| eprintln!("audio stream error: {}", err),
@@ -85,7 +99,8 @@ impl AudioLink {
     
         return Ok(AudioLink {
             stream,
-            reader
+            reader,
+            status
         });
     }
 
@@ -104,9 +119,16 @@ async fn obtain_input_device() -> Result<(cpal::SupportedStreamConfig, cpal::Dev
     return Ok((config, input_device));
 }
 
-
+ 
 pub struct Client {
-    audio_link: AudioLink
+    audio_link: AudioLink,
+    pub name: String
+}
+
+impl Display for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Client({})", self.name)
+    }
 }
 
 // my first step into unsafe. Fuck.
@@ -126,6 +148,7 @@ impl Client {
         audio_link.stream.play().unwrap();
 
         return Ok(Client {
+            name: url.to_owned(),
             audio_link
         });
     }
@@ -138,6 +161,22 @@ impl Client {
                     Ok(msg) => Ok(Some(msg)),
                     Err(e) => panic!("when trying to get next message from audio_link, got: {}", e)
                 }
+        }
+    }
+
+    pub fn liveness_loop(self) -> Option<Self> {
+        let check = (*self.audio_link.status.lock().expect("could not lock audio link!")).clone();
+        match check {
+            AudioLinkStatus::Alive => Some(self),
+            AudioLinkStatus::Dead => None
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        let check = (*self.audio_link.status.lock().expect("could not lock audio link!")).clone();
+        match check {
+            AudioLinkStatus::Alive => true,
+            AudioLinkStatus::Dead => false
         }
     }
 }

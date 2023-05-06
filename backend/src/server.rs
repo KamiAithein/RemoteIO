@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc};
+use std::time::Duration;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -22,14 +23,20 @@ use futures::{FutureExt, StreamExt};
 
 
 // Creates a cpal audio stream pulling from some SyncAudioStream
-fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device, liveness: Arc<Mutex<ClientStatus>>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     
     let audio_stream = output_device
     .build_output_stream(
         &config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
 
-            let next = audio_data_stream.get_next_batch().expect("couldnt get next value!");
+            let next = match audio_data_stream.get_next_batch() {
+                Some(next) => next,
+                None => {
+                    *liveness.blocking_lock() = ClientStatus::Dead;
+                    return
+                },
+            };
 
             for (d, f) in data.into_iter().zip(next.iter()) {
                 
@@ -213,18 +220,30 @@ impl AsyncAudioStream for VirtualOutputDevice {
     }
 }
 
-#[derive(Debug)]
-struct Client {
-    name: String
+enum ClientStatus {
+    Alive,
+    Dead
 }
+struct Client {
+    name: String,
+    stream: cpal::Stream,
+    stream_status: Arc<Mutex<ClientStatus>>
+
+}
+
+
+
+
+unsafe impl core::marker::Send for Client {}
+
 struct ProgramState {
     clients: Arc<Mutex<Vec<Client>>>
 }
 
-type AudioState = std::collections::HashMap<String, cpal::Stream>;
+
 
 impl Client {
-    pub async fn new(stream: TcpStream) -> Result<(Client, cpal::Stream), Box<dyn std::error::Error>> {
+    pub async fn new(stream: TcpStream) -> Result<Client, Box<dyn std::error::Error>> {
         let mut virtual_device = VirtualOutputDevice::new(accept_async(stream).await.unwrap());
 
         let name = virtual_device.websocket.get_ref().peer_addr().unwrap();
@@ -248,9 +267,12 @@ impl Client {
             .default_output_device()
             .expect("Failed to get default output device");
 
-        let stream = spawn_audio_stream(config, virtual_device, output_device)?;
+        let liveness = Arc::new(Mutex::new(ClientStatus::Alive));
+        let stream_liveness = Arc::clone(&liveness);
 
-        return Ok((Client {name: name.to_string()}, stream));
+        let stream = spawn_audio_stream(config, virtual_device, output_device, stream_liveness)?;
+
+        return Ok(Client {name: name.to_string(), stream, stream_status: liveness});
 
 
     } 
@@ -261,7 +283,7 @@ async fn acquire_locks2<'t1, 't2, T1, T2>(l1: &'t1 Arc<Mutex<T1>>, l2: &'t2 Arc<
     return (l1.lock().await, l2.lock().await);
 }
 
-async fn audio_link_listener(program_state: Arc<ProgramState>, audio_state: Arc<Mutex<AudioState>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_link_listener(program_state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
     let config = &remoteio_shared::config;
 
     let listener = TcpListener::bind(&config.server_endpoint).await.unwrap();
@@ -270,30 +292,33 @@ async fn audio_link_listener(program_state: Arc<ProgramState>, audio_state: Arc<
     while let Ok((tcp_stream, _)) = listener.accept().await {
         let name = tcp_stream.peer_addr().unwrap().to_string();
             
-        let (client, stream) = Client::new(tcp_stream).await?;
+        let client = Client::new(tcp_stream).await?;
 
-        let (mut ul_clients, mut ul_audio_state) = acquire_locks2(&program_state.clients, &audio_state).await;
+        let mut ul_clients = program_state.clients.lock().await;
         
         ul_clients.push(client);
-        ul_audio_state.insert(name, stream);
     }
 
     Ok(())
 }
 
-async fn audio_link_control(program_state: Arc<ProgramState>, audio_state: Arc<Mutex<AudioState>>) -> Result<(), Box<dyn std::error::Error>> {
-
+async fn audio_link_control(program_state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
+    
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
 
-        let (ul_clients, mut ul_streams) = acquire_locks2(&program_state.clients, &audio_state).await;
-
-        let names = ul_clients.iter().map(|client| client.name.clone() ).collect::<Vec<String>>();
-        let to_removes = ul_streams.keys().map(|k| k.to_owned() ).filter(|key| !names.contains(key)).collect::<Vec<String>>();
+        let program_state = Arc::clone(&program_state);
+        let print_program_state = Arc::clone(&program_state);
         
-        for to_remove in to_removes {
-            // ul_streams.get(&to_pause).unwrap().pause()?;
-            ul_streams.remove(&to_remove);
-        }
+        tokio::task::spawn_blocking(move || {
+            let clients = &program_state.clients;
+    
+            let mut ul_clients = clients.blocking_lock();
+            ul_clients.retain(|client| match *client.stream_status.blocking_lock() { ClientStatus::Alive => true, _ => false });
+        }).await.expect("could not remove clients due to error");
+
+        println!("clients: {}", print_program_state.clients.lock().await.iter().map(|c| c.name.to_owned()).collect::<Vec<String>>().join(","));
+        interval.tick().await;
         
     }
 
@@ -302,19 +327,15 @@ async fn audio_link_control(program_state: Arc<ProgramState>, audio_state: Arc<M
 
 async fn audio_link_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
 
-    let mut streams = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
     let listener_state = Arc::clone(&state);
-    let listener_streams = Arc::clone(&streams);
 
     let control_state = Arc::clone(&state);
-    let control_streams = Arc::clone(&streams);
 
     // audio stream creator / destroyer signal generator
-    let listener_future = audio_link_listener(listener_state, listener_streams);
+    let listener_future = audio_link_listener(listener_state);
 
     // creator / destroyer signal handler
-    let control_future = audio_link_control(control_state, control_streams);
+    let control_future = audio_link_control(control_state);
 
     let _ = futures::join!(listener_future, control_future);
 
@@ -323,7 +344,7 @@ async fn audio_link_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::er
 }
 
 async fn pop(State(state): State<Arc<ProgramState>>) -> String {
-    let mut ul_clients = state.clients.lock().await;
+    let mut ul_clients: MutexGuard<Vec<Client>> = state.clients.lock().await;
 
 
     return match ul_clients.pop() {

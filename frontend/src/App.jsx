@@ -9,6 +9,7 @@ function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
   const [list, setList] = useState(["default"]);
+  const [wsAddr, setWsAddr] = useState("");
 
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
@@ -22,11 +23,12 @@ function App() {
 
   async function pop(name) {
     await invoke("pop", { name });
+    await getList();
   }
 
   async function connect(wsAddr) {
-    console.log("what the fuck");
     await invoke("connect", { wsAddr });
+    await getList();
   }
 
   useEffect(() => {
@@ -38,6 +40,14 @@ function App() {
 
     return () => clearInterval(intervalId);
   }, []);
+
+  const handleChange = (event) => {
+    setWsAddr(event.target.value);
+  }
+
+  const handleClick = async () => {
+    await connect(wsAddr);
+  }
 
   return (
     <div>
@@ -54,10 +64,15 @@ function App() {
           ))}
         </div>
         <div label="Client">
-          <button 
-            onClick={(e) => {
-              connect("ws://0.0.0.0:8000");
-              }}>ws://0.0.0.0:8000</button>
+          <div>
+              <input
+                type="text"
+                onChange={handleChange}
+                value={wsAddr}
+                ></input>
+
+              <button onClick={handleClick}>connect!</button>
+          </div>
         </div>
       </Tabs>
     </div>
