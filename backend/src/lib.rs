@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 
 pub mod client;
+pub mod server;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BinStreamConfig {

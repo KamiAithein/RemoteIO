@@ -12,14 +12,15 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-async fn pop(state: tauri::State<'_, Arc<Mutex<ClientState>>>, name: String) -> Result<String, String> {
+async fn client_disconnect_server(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, name: String) -> Result<String, String> {
+    println!("calling client_disconnect_server");
     let ul_state = state.lock().await;
-    let mut ul_connections = ul_state.connections.lock().await;
+    let mut ul_client_server_connections = ul_state.client_server_connections.lock().await;
 
-    let size_pre = ul_connections.len();
-    ul_connections.retain(|client| client.name != name);
+    let size_pre = ul_client_server_connections.len();
+    ul_client_server_connections.retain(|client| client.name != name);
 
-    if size_pre != ul_connections.len() + 1 {
+    if size_pre != ul_client_server_connections.len() + 1 {
         Err(format!("failed to pop {}", name))
     } else {
         Ok(name)
@@ -29,7 +30,7 @@ async fn pop(state: tauri::State<'_, Arc<Mutex<ClientState>>>, name: String) -> 
 
 
 #[tauri::command]
-async fn connect(state: tauri::State<'_, Arc<Mutex<ClientState>>>, ws_addr: String) -> Result<(), String> {
+async fn client_connect_server(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, ws_addr: String) -> Result<(), String> {
     println!("connect! {}", ws_addr);
     let client = match remoteio_backend::client::Client::new(&ws_addr).await {
         Ok(client) => client,
@@ -37,34 +38,60 @@ async fn connect(state: tauri::State<'_, Arc<Mutex<ClientState>>>, ws_addr: Stri
     };
 
     let ul_state = state.lock().await;
-    let ul_connections = &mut ul_state.connections.lock().await;
-    ul_connections.push(client);
+    let ul_client_server_connections = &mut ul_state.client_server_connections.lock().await;
+    ul_client_server_connections.push(client);
 
     Ok(())
 }
 
 #[tauri::command]
-async fn list(state: tauri::State<'_, Arc<Mutex<ClientState>>>) -> Result<Vec<String>, String> {
-    let ul_state = state.lock().await;
-    let ul_connections = ul_state.connections.lock().await;
+async fn client_server_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
+    println!("calling client_server_list");
 
-    let list = ul_connections.iter().map(|client|client.name.clone()).collect::<Vec<String>>();
+    let ul_state = state.lock().await;
+    let ul_client_server_connections = ul_state.client_server_connections.lock().await;
+
+    let list = ul_client_server_connections.iter().map(|client|client.name.clone()).collect::<Vec<String>>();
 
     println!("calling list! {}", list.join(","));
     return Ok(list);
 }
 
+#[tauri::command]
+async fn server_client_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
+    println!("calling server_client_list");
+
+    let ul_state = state.lock().await;
+    let ul_server_client_connections = ul_state.server_state.server_state.clients.lock().await;
+
+    let list = ul_server_client_connections.iter().map(|client| client.name.to_owned()).collect::<Vec<String>>();
+
+
+    Ok(list)
+}
+
 
 #[derive(Default)]
-pub struct ClientState {
-    connections: Arc<Mutex<Vec<remoteio_backend::client::Client>>>
+pub struct ProgramState {
+    client_server_connections: Arc<Mutex<Vec<remoteio_backend::client::Client>>>,
+    server_state: Arc<remoteio_backend::server::Server>,
 }
 
 
 #[tokio::main]
 async fn main() {
 
-    let state = Arc::new(Mutex::new(ClientState{ connections: Arc::new(Mutex::new(Vec::new())) }));
+    // set up server
+    let server_state = match remoteio_backend::server::Server::new("0.0.0.0:8080", "0.0.0.0:8000").await {
+        Ok(server_state) => server_state,
+        Err(e) => panic!("panicking with {}", e)
+    };
+
+    let state = 
+        Arc::new(Mutex::new(ProgramState { 
+            client_server_connections: Arc::new(Mutex::new(Vec::new())),
+            server_state: Arc::new(server_state),
+    }));
     let check_state = Arc::clone(&state);
 
 
@@ -75,20 +102,26 @@ async fn main() {
         
         loop {
             let ul_check_state = &mut check_state.lock().await;
-            let ul_connections = &mut ul_check_state.connections.lock().await;
+            let ul_client_server_connections = &mut ul_check_state.client_server_connections.lock().await;
     
-            ul_connections.retain(|client| client.is_alive());
+            ul_client_server_connections.retain(|client| client.is_alive());
 
-            println!("liveness: {}", ul_connections.iter().map(|client| format!("{}:{}", client.name, client.is_alive())).collect::<Vec<String>>().join(","));
+            println!("liveness: {}", ul_client_server_connections.iter().map(|client| format!("{}:{}", client.name, client.is_alive())).collect::<Vec<String>>().join(","));
 
             interval.tick().await;
         }
 
     });
 
+
     tauri::Builder::default()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![greet, list, pop, connect])
+        .invoke_handler(tauri::generate_handler![
+            greet, 
+            client_server_list, 
+            client_disconnect_server, 
+            client_connect_server,
+            server_client_list])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 

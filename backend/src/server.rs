@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, Future};
 
 
 // Creates a cpal audio stream pulling from some SyncAudioStream
@@ -220,14 +220,14 @@ impl AsyncAudioStream for VirtualOutputDevice {
     }
 }
 
-enum ClientStatus {
+pub enum ClientStatus {
     Alive,
     Dead
 }
-struct Client {
-    name: String,
+pub struct Client {
+    pub name: String,
     stream: cpal::Stream,
-    stream_status: Arc<Mutex<ClientStatus>>
+    pub stream_status: Arc<Mutex<ClientStatus>>
 
 }
 
@@ -236,8 +236,11 @@ struct Client {
 
 unsafe impl core::marker::Send for Client {}
 
-struct ProgramState {
-    clients: Arc<Mutex<Vec<Client>>>
+#[derive(Default)]
+pub struct ServerState {
+    pub clients: Arc<Mutex<Vec<Client>>>,
+    pub api_endpoint: String,
+    pub ws_endpoint: String
 }
 
 
@@ -255,7 +258,7 @@ impl Client {
         let config_message = virtual_device.websocket.next().await.expect("couldnt get config message!").expect("couldnt get config message!");
         let config_data = config_message.into_data();
 
-        let config_des: remoteio_backend::BinStreamConfig = bincode::deserialize(&config_data).expect("couldnt deserialize message!");
+        let config_des: crate::BinStreamConfig = bincode::deserialize(&config_data).expect("couldnt deserialize message!");
         let config = cpal::StreamConfig {
             channels: config_des.channels,
             sample_rate: cpal::SampleRate(config_des.sample_rate), // Audio device default sample rate is set to 192000
@@ -283,11 +286,9 @@ async fn acquire_locks2<'t1, 't2, T1, T2>(l1: &'t1 Arc<Mutex<T1>>, l2: &'t2 Arc<
     return (l1.lock().await, l2.lock().await);
 }
 
-async fn audio_link_listener(program_state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = &remoteio_shared::config;
-
-    let listener = TcpListener::bind(&config.server_endpoint).await.unwrap();
-    println!("Listening on: {}", &config.server_endpoint);
+async fn audio_link_listener(program_state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&program_state.ws_endpoint).await.unwrap();
+    println!("Listening on: {}", &program_state.ws_endpoint);
     
     while let Ok((tcp_stream, _)) = listener.accept().await {
         let name = tcp_stream.peer_addr().unwrap().to_string();
@@ -302,7 +303,7 @@ async fn audio_link_listener(program_state: Arc<ProgramState>) -> Result<(), Box
     Ok(())
 }
 
-async fn audio_link_control(program_state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_link_control(program_state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
     
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -325,25 +326,28 @@ async fn audio_link_control(program_state: Arc<ProgramState>) -> Result<(), Box<
     Ok(())
 }
 
-async fn audio_link_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_link_main(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
 
     let listener_state = Arc::clone(&state);
 
     let control_state = Arc::clone(&state);
 
     // audio stream creator / destroyer signal generator
-    let listener_future = audio_link_listener(listener_state);
+    tokio::spawn(async move {
+        let _ = audio_link_listener(listener_state).await; 
+    });
 
     // creator / destroyer signal handler
-    let control_future = audio_link_control(control_state);
+    tokio::spawn(async move {
+        let _ = audio_link_control(control_state).await;
+    });
 
-    let _ = futures::join!(listener_future, control_future);
 
     Ok(())
     
 }
 
-async fn pop(State(state): State<Arc<ProgramState>>) -> String {
+async fn pop(State(state): State<Arc<ServerState>>) -> String {
     let mut ul_clients: MutexGuard<Vec<Client>> = state.clients.lock().await;
 
 
@@ -353,7 +357,7 @@ async fn pop(State(state): State<Arc<ProgramState>>) -> String {
     };
 }
 
-async fn pop_client(State(state): State<Arc<ProgramState>>, Path(client_name): Path<String>) -> String {
+async fn pop_client(State(state): State<Arc<ServerState>>, Path(client_name): Path<String>) -> String {
     let mut ul_clients = state.clients.lock().await;
 
     let i = ul_clients.iter().map(|client| client.name.clone()).position(|name| name == client_name);
@@ -364,7 +368,7 @@ async fn pop_client(State(state): State<Arc<ProgramState>>, Path(client_name): P
     
 }
 
-async fn list(State(state): State<Arc<ProgramState>>) -> axum::Json<Vec<String>> {
+async fn list(State(state): State<Arc<ServerState>>) -> axum::Json<Vec<String>> {
     let ul_clients = state.clients.lock().await;
 
     let clients = ul_clients
@@ -379,16 +383,16 @@ async fn list(State(state): State<Arc<ProgramState>>) -> axum::Json<Vec<String>>
     }
 }
 
-async fn audio_control_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = &remoteio_shared::config;
+async fn audio_control_main(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
+    let app_state = Arc::clone(&state);
     
     let app = Router::new()
         .route("/pop", get(pop))
         .route("/pop/:client_name", get(pop_client))
         .route("/list", get(list))
-        .with_state(state);
+        .with_state(app_state);
 
-    axum::Server::bind(&config.rest_endpoint.parse().unwrap())
+    axum::Server::bind(&state.api_endpoint.parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
@@ -396,20 +400,39 @@ async fn audio_control_main(state: Arc<ProgramState>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-
-    let state: Arc<ProgramState> = Arc::new(ProgramState{clients: Arc::new(Mutex::new(vec![]))});
-
-    let audio_link_state = Arc::clone(&state);
-    let audio_control_state = Arc::clone(&state);
-    
-    // Links audio devices
-    let audio_link_future = audio_link_main(audio_link_state);
-
-    // allows user to manipulate audio devices
-    let audio_control_future = audio_control_main(audio_control_state);
-
-    let _ = futures::join!(audio_control_future, audio_link_future);
-    
+#[derive(Default)]
+pub struct Server {
+    pub server_state: Arc<ServerState>
 }
+
+impl Server {
+    pub async fn new(api_endpoint: &str, ws_endpoint: &str) -> Result<Server, Box<dyn std::error::Error>> {
+
+        let state: Arc<ServerState> = Arc::new(ServerState{clients: Arc::new(Mutex::new(vec![])), api_endpoint: api_endpoint.to_owned(), ws_endpoint: ws_endpoint.to_owned()});
+
+        let return_state = Arc::clone(&state);
+        let audio_link_state = Arc::clone(&state);
+        let audio_control_state = Arc::clone(&state);
+        
+        // Links audio devices
+        tokio::spawn(async move {
+            let _ = audio_link_main(audio_link_state).await;
+        });
+
+        // controls audio devices
+        tokio::spawn(async move {
+            let _ = audio_control_main(audio_control_state).await;
+        });
+
+        // let _ = futures::join!(audio_control_future, audio_link_future);
+
+        return Ok(Server { server_state: return_state});
+    } 
+}
+
+// #[tokio::main]
+// async fn main() {
+//     let _ = Server::start(remoteio_shared::config.rest_endpoint, remoteio_shared::config.ws_endpoint).await;
+    
+    
+// }

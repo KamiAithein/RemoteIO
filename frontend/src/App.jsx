@@ -8,70 +8,86 @@ import Tabs from "./components/Tabs"
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
-  const [list, setList] = useState(["default"]);
+  const [serverClientList, setServerClientList] = useState(["default"]);
+  const [clientServerList, setClientServerList] = useState(["default"]);
   const [wsAddr, setWsAddr] = useState("");
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-    setGreetMsg(await invoke("greet", { name }));
+  async function updateClientServerList() {
+    let list = await invoke("client_server_list");
+    setClientServerList(list);
   }
 
-  async function getList() {
-    let list = await invoke("list");
-    setList(list);
+  async function updateServerClientList() {
+    let list = await invoke("server_client_list");
+    setServerClientList(list);
   }
 
-  async function pop(name) {
-    await invoke("pop", { name });
-    await getList();
+  async function clientDisconnectServer(name) {
+    await invoke("client_disconnect_server", { name });
+    await updateClientServerList();
   }
 
-  async function connect(wsAddr) {
-    await invoke("connect", { wsAddr });
-    await getList();
+  async function clientConnectServer(wsAddr) {
+    await invoke("client_connect_server", { wsAddr });
+    await updateClientServerList();
+  }
+
+  async function handleWSAddrChange(event) {
+    setWsAddr(event.target.value);
+  }
+
+  async function handleWSAddrConnect() {
+    await clientConnectServer(wsAddr);
+    await updateClientServerList();
   }
 
   useEffect(() => {
-    getList()
+    updateClientServerList()
+    updateServerClientList()
 
     const intervalId = setInterval(() => {
-      getList();
+      updateClientServerList()
+      updateServerClientList()
     }, 5000);
 
     return () => clearInterval(intervalId);
   }, []);
 
-  const handleChange = (event) => {
-    setWsAddr(event.target.value);
-  }
 
-  const handleClick = async () => {
-    await connect(wsAddr);
-  }
 
   return (
     <div>
       <h1>Welcome to RemoteIO!</h1>
       <Tabs>
         <div label="Server">
-          {list.map((item, index) => (
+          {serverClientList.map((item, index) => (
             <div>
               <button>{item}</button>
-              <button onClick={(e)=>{
-                pop(item);
-              }}>remove</button>
             </div>
           ))}
         </div>
         <div label="Client">
           <div>
-              <input
-                type="text"
-                onChange={handleChange}
-                value={wsAddr}
-                ></input>
+            <input
+              type="text"
+              onChange={handleWSAddrChange}
+              value={wsAddr}
+            ></input>
 
-              <button onClick={handleClick}>connect!</button>
+            <button onClick={handleWSAddrConnect}>connect!</button>
+          </div>
+          <div>
+            {clientServerList.map((item, index) => (
+              <div>
+                <button>
+                  {item}
+                </button>
+                <button
+                  onClick={() => clientDisconnectServer(item)}>
+                  disconnect
+                </button>
+              </div>
+            ))}
           </div>
         </div>
       </Tabs>
