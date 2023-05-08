@@ -10,3 +10,13 @@ pub struct BinStreamConfig {
     pub buffer_size: u32,
 
 }
+
+
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum BinMessages {
+    BinHello,
+    BinConfig(BinStreamConfig),
+    BinDevicesResponse(Vec<String>),
+    BinDevicesRequest
+}

@@ -25,7 +25,9 @@ struct Connection {
 
 impl Connection {
     async fn connect_to_server(url: &str, config: cpal::SupportedStreamConfig) -> Result<(Connection, Response), Box<dyn std::error::Error>> {
+        println!("connecting to server {}", url);
         let (socket, resp) = connect_async(url).await?;
+        println!("got connection!");
         let (writer, reader) = socket.split();
         
         let connection = Connection {
@@ -34,8 +36,24 @@ impl Connection {
          reader,
          config
         };
+
      
         return Ok((connection, resp));
+     }
+
+     async fn send_client_devices(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+        let devices = 
+            cpal::default_host()
+                .input_devices()
+                .expect("could not get input devices!")
+                .map(|d| d.name().expect("could not get device name!"))
+                .collect::<Vec<String>>();
+
+        let bin_devices = bincode::serialize(&crate::BinMessages::BinDevicesResponse(devices))?;
+
+        connection.writer.send(Message::binary(bin_devices)).await.expect("error sending devices!");
+
+        Ok(())
      }
 
      async fn send_client_config(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +63,7 @@ impl Connection {
             buffer_size: 4096
         };
     
-        let bin_config = bincode::serialize(&bin_config_struct)?;
+        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(bin_config_struct))?;
     
         connection.writer.send(Message::binary(bin_config)).await.expect("error sending config!");
     
@@ -145,7 +163,7 @@ impl Client {
         // create stream where every float is send to the server
         let audio_link = AudioLink::new(connection, &input_device).await?;
 
-        audio_link.stream.play().unwrap();
+        audio_link.stream.play().unwrap(); 
 
         return Ok(Client {
             name: url.to_owned(),

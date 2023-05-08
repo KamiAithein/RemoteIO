@@ -62,7 +62,8 @@ async fn server_client_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -
     println!("calling server_client_list");
 
     let ul_state = state.lock().await;
-    let ul_server_client_connections = ul_state.server_state.server_state.clients.lock().await;
+    let ul_server_state = ul_state.server_state.lock().await;
+    let ul_server_client_connections = ul_server_state.server_state.clients.lock().await;
 
     let list = ul_server_client_connections.iter().map(|client| client.name.to_owned()).collect::<Vec<String>>();
 
@@ -70,11 +71,34 @@ async fn server_client_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -
     Ok(list)
 }
 
+#[tauri::command]
+async fn server_output_device_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
+    println!("calling server_output_device_list");
+
+    let ul_state = state.lock().await;
+    let ul_server_state = ul_state.server_state.lock().await;
+    let server_devices = ul_server_state.server_state.output_devices.lock().await.clone();
+
+    return Ok(server_devices);
+
+}
+
+#[tauri::command]
+async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, dname: String) -> Result<(), String> {
+    println!("calling change_server_output_Device");
+
+    let mut ul_state = state.lock().await;
+    let mut ul_server_state = ul_state.server_state.lock().await;
+    ul_server_state.set_current_device(&dname).await.expect("could not change output device!");
+
+    return Ok(());
+}
+
 
 #[derive(Default)]
 pub struct ProgramState {
     client_server_connections: Arc<Mutex<Vec<remoteio_backend::client::Client>>>,
-    server_state: Arc<remoteio_backend::server::Server>,
+    server_state: Arc<Mutex<remoteio_backend::server::Server>>,
 }
 
 
@@ -82,7 +106,7 @@ pub struct ProgramState {
 async fn main() {
 
     // set up server
-    let server_state = match remoteio_backend::server::Server::new("0.0.0.0:8080", "0.0.0.0:8000").await {
+    let server_state = match remoteio_backend::server::Server::new("0.0.0.0:8080", "0.0.0.0:8000", None).await {
         Ok(server_state) => server_state,
         Err(e) => panic!("panicking with {}", e)
     };
@@ -90,7 +114,7 @@ async fn main() {
     let state = 
         Arc::new(Mutex::new(ProgramState { 
             client_server_connections: Arc::new(Mutex::new(Vec::new())),
-            server_state: Arc::new(server_state),
+            server_state: Arc::new(Mutex::new(server_state)),
     }));
     let check_state = Arc::clone(&state);
 
@@ -121,7 +145,10 @@ async fn main() {
             client_server_list, 
             client_disconnect_server, 
             client_connect_server,
-            server_client_list])
+            server_client_list,
+            server_output_device_list,
+            change_server_output_device,
+            ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 

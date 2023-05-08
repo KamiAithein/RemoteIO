@@ -23,14 +23,15 @@ use futures::{FutureExt, StreamExt, Future};
 
 
 // Creates a cpal audio stream pulling from some SyncAudioStream
-fn spawn_audio_stream(config: StreamConfig, mut audio_data_stream: (impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static), output_device: cpal::Device, liveness: Arc<Mutex<ClientStatus>>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+fn spawn_audio_stream(config: &StreamConfig, audio_data_stream: Arc<Mutex<(impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static)>>, output_device: &mut cpal::Device, liveness: Arc<Mutex<ClientStatus>>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     
     let audio_stream = output_device
     .build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-
-            let next = match audio_data_stream.get_next_batch() {
+            
+            let mut ul_audio_data_stream = audio_data_stream.blocking_lock();
+            let next = match ul_audio_data_stream.get_next_batch() {
                 Some(next) => next,
                 None => {
                     *liveness.blocking_lock() = ClientStatus::Dead;
@@ -227,7 +228,10 @@ pub enum ClientStatus {
 pub struct Client {
     pub name: String,
     stream: cpal::Stream,
-    pub stream_status: Arc<Mutex<ClientStatus>>
+    pub stream_status: Arc<Mutex<ClientStatus>>,
+    pub stream_config: cpal::StreamConfig,
+    virtual_output: Arc<Mutex<VirtualOutputDevice>>
+
 
 }
 
@@ -236,55 +240,71 @@ pub struct Client {
 
 unsafe impl core::marker::Send for Client {}
 
-#[derive(Default)]
 pub struct ServerState {
     pub clients: Arc<Mutex<Vec<Client>>>,
+    pub output_devices: Arc<Mutex<Vec<String>>>,
     pub api_endpoint: String,
-    pub ws_endpoint: String
+    pub ws_endpoint: String,
+    pub current_device: Arc<Mutex<cpal::Device>>
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        let default_output_device = cpal::default_host().default_output_device().expect("could not get default output device!");
+
+        Self { 
+            current_device: Arc::new(Mutex::new(default_output_device)),
+            ..Default::default()
+        }
+    }
 }
 
 
-
 impl Client {
-    pub async fn new(stream: TcpStream) -> Result<Client, Box<dyn std::error::Error>> {
-        let mut virtual_device = VirtualOutputDevice::new(accept_async(stream).await.unwrap());
+    pub async fn new(stream: TcpStream, device_name: &str) -> Result<Client, Box<dyn std::error::Error>> {
+        let mut virtual_device = Arc::new(Mutex::new(VirtualOutputDevice::new(accept_async(stream).await.unwrap())));
+        let mut ul_virtual_device = virtual_device.lock().await;
 
-        let name = virtual_device.websocket.get_ref().peer_addr().unwrap();
+        let name = ul_virtual_device.websocket.get_ref().peer_addr().unwrap();
         println!(
             "New WebSocket connection: {}",
             name
         );
 
-        let config_message = virtual_device.websocket.next().await.expect("couldnt get config message!").expect("couldnt get config message!");
+        let config_message = ul_virtual_device.websocket.next().await.expect("couldnt get config message!").expect("couldnt get config message!");
         let config_data = config_message.into_data();
+        
+        let config_des = match bincode::deserialize(&config_data).expect("couldnt deserialize message!") {
+            crate::BinMessages::BinConfig(config_des) => config_des,
+            _ => panic!("config message not sent first!")
+        };
 
-        let config_des: crate::BinStreamConfig = bincode::deserialize(&config_data).expect("couldnt deserialize message!");
         let config = cpal::StreamConfig {
             channels: config_des.channels,
             sample_rate: cpal::SampleRate(config_des.sample_rate), // Audio device default sample rate is set to 192000
             buffer_size: cpal::BufferSize::Default,
         };
 
+
         let host = cpal::default_host();
-        let output_device = host
-            .default_output_device()
-            .expect("Failed to get default output device");
+        let mut output_device = host
+            .output_devices()
+            .unwrap()
+            .filter(|d|d.name().expect("could not get audio device name!") == device_name)
+            .next()
+            .expect(&format!("could not find audio device with name {}", device_name));
 
         let liveness = Arc::new(Mutex::new(ClientStatus::Alive));
         let stream_liveness = Arc::clone(&liveness);
 
-        let stream = spawn_audio_stream(config, virtual_device, output_device, stream_liveness)?;
+        let stream = spawn_audio_stream(&config, Arc::clone(&virtual_device), &mut output_device, stream_liveness)?;
 
-        return Ok(Client {name: name.to_string(), stream, stream_status: liveness});
+        return Ok(Client {name: name.to_string(), stream, stream_status: liveness, stream_config: config.clone(), virtual_output: Arc::clone(&virtual_device)});
 
 
     } 
 }
 
-//this is a sort of black magic as to why it doesn't deadlock
-async fn acquire_locks2<'t1, 't2, T1, T2>(l1: &'t1 Arc<Mutex<T1>>, l2: &'t2 Arc<Mutex<T2>>) -> (MutexGuard<'t1, T1>, MutexGuard<'t2, T2>) {
-    return (l1.lock().await, l2.lock().await);
-}
 
 async fn audio_link_listener(program_state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&program_state.ws_endpoint).await.unwrap();
@@ -293,7 +313,7 @@ async fn audio_link_listener(program_state: Arc<ServerState>) -> Result<(), Box<
     while let Ok((tcp_stream, _)) = listener.accept().await {
         let name = tcp_stream.peer_addr().unwrap().to_string();
             
-        let client = Client::new(tcp_stream).await?;
+        let client = Client::new(tcp_stream, &program_state.current_device.lock().await.name().expect("couldnt get device name!")).await?;
 
         let mut ul_clients = program_state.clients.lock().await;
         
@@ -315,6 +335,12 @@ async fn audio_link_control(program_state: Arc<ServerState>) -> Result<(), Box<d
             let clients = &program_state.clients;
     
             let mut ul_clients = clients.blocking_lock();
+            for client in ul_clients.iter() {
+                match *client.stream_status.blocking_lock() {
+                    ClientStatus::Dead => {let _ = client.stream.pause();},
+                    _ => {}
+                }
+            }
             ul_clients.retain(|client| match *client.stream_status.blocking_lock() { ClientStatus::Alive => true, _ => false });
         }).await.expect("could not remove clients due to error");
 
@@ -347,58 +373,9 @@ async fn audio_link_main(state: Arc<ServerState>) -> Result<(), Box<dyn std::err
     
 }
 
-async fn pop(State(state): State<Arc<ServerState>>) -> String {
-    let mut ul_clients: MutexGuard<Vec<Client>> = state.clients.lock().await;
 
 
-    return match ul_clients.pop() {
-        Some(value) => format!("received {}", value.name),
-        None => "no clients!".to_owned()
-    };
-}
 
-async fn pop_client(State(state): State<Arc<ServerState>>, Path(client_name): Path<String>) -> String {
-    let mut ul_clients = state.clients.lock().await;
-
-    let i = ul_clients.iter().map(|client| client.name.clone()).position(|name| name == client_name);
-    match i {
-        Some(i) => ul_clients.remove(i).name,
-        None => format!("could not find {client_name}")
-    }
-    
-}
-
-async fn list(State(state): State<Arc<ServerState>>) -> axum::Json<Vec<String>> {
-    let ul_clients = state.clients.lock().await;
-
-    let clients = ul_clients
-        .iter()
-        .map(|client| client.name.clone())
-        .collect::<Vec<String>>();
-
-    if clients.is_empty() {
-        return axum::Json::from(vec![]);
-    } else {
-        return axum::Json::from(clients);
-    }
-}
-
-async fn audio_control_main(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
-    let app_state = Arc::clone(&state);
-    
-    let app = Router::new()
-        .route("/pop", get(pop))
-        .route("/pop/:client_name", get(pop_client))
-        .route("/list", get(list))
-        .with_state(app_state);
-
-    axum::Server::bind(&state.api_endpoint.parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
-
-    Ok(())
-}
 
 #[derive(Default)]
 pub struct Server {
@@ -406,22 +383,90 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn new(api_endpoint: &str, ws_endpoint: &str) -> Result<Server, Box<dyn std::error::Error>> {
+    pub async fn set_current_device(&mut self, dname: &str) -> Result<(), Box<dyn std::error::Error>> {
 
-        let state: Arc<ServerState> = Arc::new(ServerState{clients: Arc::new(Mutex::new(vec![])), api_endpoint: api_endpoint.to_owned(), ws_endpoint: ws_endpoint.to_owned()});
+        let mut ul_current_device = self.server_state.current_device.lock().await;
+
+
+        *ul_current_device =
+            cpal::default_host()
+            .output_devices()
+            .expect("could not get output devices")
+            .filter(|d|d.name().expect("could not get device name") == dname)
+            .next()
+            .expect(&format!("could not find device with name {}", dname));
+
+        // for every client, delete the old stream and create a new one with the new device
+        for client in self.server_state.clients.lock().await.iter_mut() {
+            let _ = client.stream.pause();
+
+            match spawn_audio_stream(
+                &client.stream_config, 
+                Arc::clone(&client.virtual_output), 
+                &mut ul_current_device, 
+                Arc::clone(&client.stream_status)
+            ) {
+                Ok(stream) => client.stream = stream,
+                Err(e) => panic!("error changing audio device!")
+            };
+
+            // spawn_audio_stream(config, audio_data_stream, output_device, liveness)
+        }
+
+        Ok(())
+    }
+
+    pub async fn new(api_endpoint: &str, ws_endpoint: &str, device: Option<String>) -> Result<Server, Box<dyn std::error::Error>> {
+
+        let output_devices = Arc::new(Mutex::new(vec![]));
+        let state_output_devices = Arc::clone(&output_devices);
+
+        let device = match device {
+            Some(device) => cpal::default_host()
+                                        .output_devices()
+                                        .expect("could not get output devices")
+                                        .filter(|d|d.name().expect("could not get device name") == device)
+                                        .next()
+                                        .expect("could not find device!"),
+
+            None => cpal::default_host().default_output_device().expect("could not get default output device!")
+        };
+
+        let state: Arc<ServerState> = 
+            Arc::new(
+                ServerState {
+                    clients: Arc::new(Mutex::new(vec![])), 
+                    api_endpoint: api_endpoint.to_owned(), 
+                    ws_endpoint: ws_endpoint.to_owned(), 
+                    output_devices: state_output_devices,
+                    current_device: Arc::new(Mutex::new(device))
+                }
+            );
 
         let return_state = Arc::clone(&state);
         let audio_link_state = Arc::clone(&state);
-        let audio_control_state = Arc::clone(&state);
         
         // Links audio devices
         tokio::spawn(async move {
             let _ = audio_link_main(audio_link_state).await;
         });
 
-        // controls audio devices
+        // keeps audio output devices up to date
         tokio::spawn(async move {
-            let _ = audio_control_main(audio_control_state).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                let input_devices = 
+                cpal::default_host()
+                .output_devices()
+                .expect("could not get input devices!")
+                .map(|d| d.name().expect("could not get device name!"))
+                .collect::<Vec<String>>();
+            
+                *output_devices.lock().await = input_devices;
+
+                interval.tick().await;
+            }
+            
         });
 
         // let _ = futures::join!(audio_control_future, audio_link_future);

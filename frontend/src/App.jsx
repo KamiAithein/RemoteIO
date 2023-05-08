@@ -10,7 +10,13 @@ function App() {
   const [name, setName] = useState("");
   const [serverClientList, setServerClientList] = useState(["default"]);
   const [clientServerList, setClientServerList] = useState(["default"]);
+  const [serverOutputList, setServerOutputList] = useState(["default"]);
   const [wsAddr, setWsAddr] = useState("");
+
+  async function updateServerOutputList() {
+    let list = await invoke("server_output_device_list");
+    setServerOutputList(list);
+  }
 
   async function updateClientServerList() {
     let list = await invoke("client_server_list");
@@ -20,6 +26,10 @@ function App() {
   async function updateServerClientList() {
     let list = await invoke("server_client_list");
     setServerClientList(list);
+  }
+
+  async function changeServerOutputDevice(dname) {
+    await invoke("change_server_output_device", { dname })
   }
 
   async function clientDisconnectServer(name) {
@@ -44,10 +54,12 @@ function App() {
   useEffect(() => {
     updateClientServerList()
     updateServerClientList()
+    updateServerOutputList();
 
     const intervalId = setInterval(() => {
       updateClientServerList()
       updateServerClientList()
+      updateServerOutputList()
     }, 5000);
 
     return () => clearInterval(intervalId);
@@ -63,6 +75,11 @@ function App() {
           {serverClientList.map((item, index) => (
             <div>
               <button>{item}</button>
+            </div>
+          ))}
+          {serverOutputList.map((item, index) => (
+            <div>
+              <button onClick={() => changeServerOutputDevice(item)}>{item}</button>
             </div>
           ))}
         </div>
