@@ -1,7 +1,9 @@
 use std::fmt::Display;
+use std::time::Duration;
 use std::{convert::TryInto, slice::from_mut};
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use tokio::sync::Mutex;
 use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use bytes::Bytes;
@@ -41,20 +43,6 @@ impl Connection {
         return Ok((connection, resp));
      }
 
-     async fn send_client_devices(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-        let devices = 
-            cpal::default_host()
-                .input_devices()
-                .expect("could not get input devices!")
-                .map(|d| d.name().expect("could not get device name!"))
-                .collect::<Vec<String>>();
-
-        let bin_devices = bincode::serialize(&crate::BinMessages::BinDevicesResponse(devices))?;
-
-        connection.writer.send(Message::binary(bin_devices)).await.expect("error sending devices!");
-
-        Ok(())
-     }
 
      async fn send_client_config(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
         let bin_config_struct = crate::BinStreamConfig {
@@ -105,14 +93,14 @@ impl AudioLink {
                     match writer.send(Message::binary(bytes)).await {
                         Ok(msg) => {},
                         Err(e) => {
-                            let mut ul_status_stream = status_stream.lock().expect("couldn't lock status!");
+                            let mut ul_status_stream = status_stream.lock().await;
                             *ul_status_stream = AudioLinkStatus::Dead;
                         }
                     }
                 });
            
             }, |err| eprintln!("audio stream error: {}", err),
-            None)
+            Some(Duration::from_secs(5)))
             .unwrap();
     
         return Ok(AudioLink {
@@ -140,7 +128,15 @@ async fn obtain_input_device() -> Result<(cpal::SupportedStreamConfig, cpal::Dev
  
 pub struct Client {
     audio_link: AudioLink,
-    pub name: String
+    pub name: String,
+    pub url: String
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        println!("dropping {}", self.name);
+        let _ = self.audio_link.stream.pause();
+    }
 }
 
 impl Display for Client {
@@ -153,22 +149,40 @@ impl Display for Client {
 unsafe impl core::marker::Send for Client {}
 
 impl Client {
-    pub async fn new(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
-        // first get config of this device
-        let (config, input_device) = obtain_input_device().await?;
-
-        // then get connection
-        let connection = Connection::new(url, config).await?;
+    pub async fn new_with(url: &str, device: &cpal::Device, config: cpal::SupportedStreamConfig) -> Result<Client, Box<dyn std::error::Error>> {
+        // get connection
+        let connection = Connection::new(url.clone(), config).await?;
 
         // create stream where every float is send to the server
-        let audio_link = AudioLink::new(connection, &input_device).await?;
+        let audio_link = AudioLink::new(connection, device).await?;
 
         audio_link.stream.play().unwrap(); 
 
         return Ok(Client {
             name: url.to_owned(),
-            audio_link
+            url: url.to_owned(),
+            audio_link,
         });
+    }
+    pub async fn new(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+        let (config, input_device) = obtain_input_device().await?;
+
+        return Client::new_with(url, &input_device, config).await;
+    }
+
+    pub async fn change_device(&mut self, device: &cpal::Device, config: cpal::SupportedStreamConfig) {
+
+        *self = Client::new_with(&self.url, device, config).await.expect("could not change device!");
+    }
+
+    pub fn get_devices(&self) -> Result<Vec<(cpal::SupportedStreamConfig, cpal::Device)>, Box<dyn std::error::Error>> {
+
+        Ok(cpal::default_host()
+            .input_devices()
+            .expect("could not get input devices")
+            .map(|device| (device.default_input_config().expect("could not get default input config!"), device))
+            .collect::<Vec<(cpal::SupportedStreamConfig, cpal::Device)>>()
+        )
     }
 
     pub async fn next_message(&mut self) -> Result<Option<Message>, Box<dyn std::error::Error>> {
@@ -182,17 +196,9 @@ impl Client {
         }
     }
 
-    pub fn liveness_loop(self) -> Option<Self> {
-        let check = (*self.audio_link.status.lock().expect("could not lock audio link!")).clone();
-        match check {
-            AudioLinkStatus::Alive => Some(self),
-            AudioLinkStatus::Dead => None
-        }
-    }
-
     pub fn is_alive(&self) -> bool {
-        let check = (*self.audio_link.status.lock().expect("could not lock audio link!")).clone();
-        match check {
+        let check = self.audio_link.status.blocking_lock();
+        match *check {
             AudioLinkStatus::Alive => true,
             AudioLinkStatus::Dead => false
         }

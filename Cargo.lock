@@ -915,6 +915,8 @@ dependencies = [
 name = "frontend"
 version = "0.0.0"
 dependencies = [
+ "cpal",
+ "futures",
  "remoteio-backend",
  "remoteio-shared",
  "reqwest",

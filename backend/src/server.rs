@@ -47,7 +47,7 @@ fn spawn_audio_stream(config: &StreamConfig, audio_data_stream: Arc<Mutex<(impl 
 
         },
         |err| eprintln!("audio stream error: {}", err),
-        None,
+        Some(Duration::from_secs(5)),
     )
     .unwrap();
 
@@ -221,6 +221,7 @@ impl AsyncAudioStream for VirtualOutputDevice {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ClientStatus {
     Alive,
     Dead
@@ -254,7 +255,10 @@ impl Default for ServerState {
 
         Self { 
             current_device: Arc::new(Mutex::new(default_output_device)),
-            ..Default::default()
+            clients: Default::default(),
+            output_devices: Default::default(),
+            api_endpoint: "http://0.0.0.0:8000".to_owned(),
+            ws_endpoint: "ws://0.0.0.0:80000".to_owned(),
         }
     }
 }
@@ -329,22 +333,43 @@ async fn audio_link_control(program_state: Arc<ServerState>) -> Result<(), Box<d
     loop {
 
         let program_state = Arc::clone(&program_state);
-        let print_program_state = Arc::clone(&program_state);
         
-        tokio::task::spawn_blocking(move || {
-            let clients = &program_state.clients;
-    
-            let mut ul_clients = clients.blocking_lock();
-            for client in ul_clients.iter() {
-                match *client.stream_status.blocking_lock() {
-                    ClientStatus::Dead => {let _ = client.stream.pause();},
-                    _ => {}
+        let clients = &program_state.clients;
+        
+        let mut ul_clients = clients.lock().await;
+        
+        for client in ul_clients.iter_mut() {
+            let status = client.stream_status.lock().await;
+            match *status {
+                ClientStatus::Dead => {let _ = client.stream.pause();},
+                _ => {}
+            }
+        }
+        
+        // tokio::task::spawn_blocking(move || {
+        let statuses = 
+            futures::future::join_all(
+                ul_clients
+                        .iter_mut()
+                        .map(|client| client.stream_status.lock()))
+                        .await
+                        .iter()
+                        .map(|cs|ClientStatus::from(**cs))
+                        .collect::<Vec<ClientStatus>>();
+
+        let mut s_iter = statuses.iter();
+        
+        ul_clients.retain(
+            |_| {
+                match s_iter.next() {
+                    Some(ClientStatus::Alive) => true,
+                    _ => false
                 }
             }
-            ul_clients.retain(|client| match *client.stream_status.blocking_lock() { ClientStatus::Alive => true, _ => false });
-        }).await.expect("could not remove clients due to error");
+        );
+        // }).await.expect("could not remove clients due to error");
 
-        println!("clients: {}", print_program_state.clients.lock().await.iter().map(|c| c.name.to_owned()).collect::<Vec<String>>().join(","));
+        println!("clients: {}", ul_clients.iter().map(|c| c.name.to_owned()).collect::<Vec<String>>().join(","));
         interval.tick().await;
         
     }
@@ -398,7 +423,11 @@ impl Server {
 
         // for every client, delete the old stream and create a new one with the new device
         for client in self.server_state.clients.lock().await.iter_mut() {
+            *client.stream_status.lock().await = ClientStatus::Dead;
             let _ = client.stream.pause();
+            
+            client.stream_status = Arc::new(Mutex::new(ClientStatus::Alive));
+
 
             match spawn_audio_stream(
                 &client.stream_config, 

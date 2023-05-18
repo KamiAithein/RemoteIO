@@ -20,6 +20,8 @@ reqwest = { version = "0.11", features = ["json"] }
 remoteio-shared = { path = "../../shared" }
 remoteio-backend = { path = "../../backend" }
 tokio = { version = "1", features = ["full"] }
+cpal = "0.15.1"
+futures = "0.3.27"
 
 
 

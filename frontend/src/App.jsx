@@ -11,7 +11,29 @@ function App() {
   const [serverClientList, setServerClientList] = useState(["default"]);
   const [clientServerList, setClientServerList] = useState(["default"]);
   const [serverOutputList, setServerOutputList] = useState(["default"]);
+  const [clientInputList , setClientInputList ] = useState({"default": ["default"]});   
   const [wsAddr, setWsAddr] = useState("");
+
+  // clientInputList.map((item, index) => (
+//     <div>
+//     <button onClick={() => changeClientInputDevice(item)}>{item}</button>
+//   </div>
+// ))}
+
+  async function updateClientInputList(name) {
+    let list = await invoke("client_input_device_list", {name});
+
+    let oldClientInputList = clientInputList;
+    oldClientInputList[name] = list;
+    
+    setClientInputList(oldClientInputList);
+  }
+
+  async function getClientList() {
+    let list = await invoke("client_list");
+    console.log(list);
+    return list;
+  }
 
   async function updateServerOutputList() {
     let list = await invoke("server_output_device_list");
@@ -30,6 +52,10 @@ function App() {
 
   async function changeServerOutputDevice(dname) {
     await invoke("change_server_output_device", { dname })
+  }
+
+  async function changeClientInputDevice(cname, dname) {
+    await invoke("change_client_input_device", { cname, dname })
   }
 
   async function clientDisconnectServer(name) {
@@ -52,14 +78,22 @@ function App() {
   }
 
   useEffect(() => {
-    updateClientServerList()
-    updateServerClientList()
+    updateClientServerList();
+    updateServerClientList();
     updateServerOutputList();
+    
+    getClientList().then((res) => res.forEach(clientName => {
+      updateClientInputList(clientName)
+    }))
 
     const intervalId = setInterval(() => {
-      updateClientServerList()
-      updateServerClientList()
-      updateServerOutputList()
+      updateClientServerList();
+      updateServerClientList();
+      updateServerOutputList();
+
+      getClientList().then((res) => res.forEach(clientName => {
+        updateClientInputList(clientName)
+      }))
     }, 5000);
 
     return () => clearInterval(intervalId);
@@ -105,6 +139,23 @@ function App() {
                 </button>
               </div>
             ))}
+            {
+              Object.entries(clientInputList).map(([client, devices], index) =>(
+                <div>
+                  <div>
+                    {client}
+                  </div>
+                  <div>
+                    {devices.map((item, index) => (
+                      <button
+                        onClick={() => changeClientInputDevice(client, item)}>
+                        {item}
+                    </button>
+                    ))}
+                  </div>
+                </div>
+              ))
+            }
           </div>
         </div>
       </Tabs>

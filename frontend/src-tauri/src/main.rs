@@ -5,6 +5,8 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{Mutex, MutexGuard};
 
+use cpal::{Device, traits::DeviceTrait};
+
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -94,6 +96,58 @@ async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramSt
     return Ok(());
 }
 
+#[tauri::command]
+async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cname: String, dname: String) -> Result<(), String> {
+    println!("calling change_client_input_Device");
+
+    let mut ul_state = state.lock().await;
+    let mut connections = ul_state.client_server_connections.lock().await;
+    
+    let mut client = connections.iter_mut().filter(|client| client.name == cname).next().expect(&format!("could not find client with name {}", cname));
+
+    let (config, device) = client.get_devices().expect("could not get devices!").into_iter().filter(|(config, device)| device.name().expect("could not get device name!") == dname).next().expect(&format!("could not find device with name {} on client {}", dname, cname));
+
+
+    client.change_device(&device, config).await;
+
+    return Ok(());
+}
+
+#[tauri::command]
+async fn client_input_device_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, name: String) -> Result<Vec<String>, String> {
+    println!("calling client_input_device_list");
+
+    // ask client for devices
+    let ul_state = state.lock().await;
+    let connections = ul_state.client_server_connections.lock().await;
+
+    let client = connections
+        .iter()
+        .filter(|client| client.name == name)
+        .next()
+        .expect(&format!("no device found with name {}", name));
+
+    Ok(client
+        .get_devices()
+        .expect("could not get devices!")
+        .iter()
+        .map(|(_, device)| device.name().expect("could not get device name!"))
+        .collect::<Vec<String>>()
+    )
+}
+
+#[tauri::command]
+async fn client_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
+    let ul_state = state.lock().await;
+    let connections = ul_state.client_server_connections.lock().await;
+
+    Ok(connections
+        .iter()
+        .map(|client| client.name.clone())
+        .collect::<Vec<String>>()
+    )
+}
+
 
 #[derive(Default)]
 pub struct ProgramState {
@@ -127,6 +181,16 @@ async fn main() {
         loop {
             let ul_check_state = &mut check_state.lock().await;
             let ul_client_server_connections = &mut ul_check_state.client_server_connections.lock().await;
+
+            // let mut to_retain = 
+            //     futures::future::join_all(
+            //         ul_client_server_connections
+            //         .iter_mut()
+            //         .map(|connection| connection.is_alive())
+            //     )
+            //     .await
+            //     .iter()
+            // ;
     
             ul_client_server_connections.retain(|client| client.is_alive());
 
@@ -148,6 +212,9 @@ async fn main() {
             server_client_list,
             server_output_device_list,
             change_server_output_device,
+            change_client_input_device,
+            client_input_device_list,
+            client_list,
             ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
