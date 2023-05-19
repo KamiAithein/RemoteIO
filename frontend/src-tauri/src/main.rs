@@ -3,9 +3,10 @@
 
 use std::{sync::Arc, time::Duration};
 
+use remoteio_backend::client::Client;
 use tokio::sync::{Mutex, MutexGuard};
 
-use cpal::{Device, traits::DeviceTrait};
+use cpal::{Device, traits::{DeviceTrait, HostTrait}};
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 #[tauri::command]
@@ -20,7 +21,16 @@ async fn client_disconnect_server(state: tauri::State<'_, Arc<Mutex<ProgramState
     let mut ul_client_server_connections = ul_state.client_server_connections.lock().await;
 
     let size_pre = ul_client_server_connections.len();
-    ul_client_server_connections.retain(|client| client.name != name);
+    let cnames = futures::future::join_all(ul_client_server_connections.iter_mut().map(|client| client.name())).await;
+    let cnames_remove = 
+        cnames
+        .iter()
+        .map(|cname| cname.to_owned() != name)
+        .collect::<Vec<bool>>();
+
+    let mut cnames_remove_iter = cnames_remove.iter(); 
+
+    ul_client_server_connections.retain(|client| cnames_remove_iter.next().expect("should never happen!").to_owned());
 
     if size_pre != ul_client_server_connections.len() + 1 {
         Err(format!("failed to pop {}", name))
@@ -34,10 +44,17 @@ async fn client_disconnect_server(state: tauri::State<'_, Arc<Mutex<ProgramState
 #[tauri::command]
 async fn client_connect_server(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, ws_addr: String) -> Result<(), String> {
     println!("connect! {}", ws_addr);
-    let client = match remoteio_backend::client::Client::new(&ws_addr).await {
-        Ok(client) => client,
-        Err(e) => return Err(format!("{}", e))
-    };
+    let mut client = 
+        remoteio_backend::client::Metal2RemoteClient::new(
+            cpal::default_host()
+            .default_input_device()
+            .expect("could not find default input device!")
+        );
+
+    match client.connect(&ws_addr).await {
+        Ok(()) => {},
+        Err(e) => panic!("could not connect due to {}", e)
+    }
 
     let ul_state = state.lock().await;
     let ul_client_server_connections = &mut ul_state.client_server_connections.lock().await;
@@ -51,9 +68,14 @@ async fn client_server_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -
     println!("calling client_server_list");
 
     let ul_state = state.lock().await;
-    let ul_client_server_connections = ul_state.client_server_connections.lock().await;
+    let mut ul_client_server_connections = ul_state.client_server_connections.lock().await;
 
-    let list = ul_client_server_connections.iter().map(|client|client.name.clone()).collect::<Vec<String>>();
+    let list = 
+        futures::future::join_all(
+            ul_client_server_connections
+            .iter_mut()
+            .map(|client| client.name())
+        ).await;
 
     println!("calling list! {}", list.join(","));
     return Ok(list);
@@ -103,35 +125,62 @@ async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramSta
     let mut ul_state = state.lock().await;
     let mut connections = ul_state.client_server_connections.lock().await;
     
-    let mut client = connections.iter_mut().filter(|client| client.name == cname).next().expect(&format!("could not find client with name {}", cname));
+    let (_, client) = 
+        // get names of everything because async restrictions
+        futures::future::join_all(connections
+            .iter_mut()
+            .map(|client| client.name())
+        )
+        .await
+        .iter()
+        // pair names to client objets
+        .zip(connections.iter_mut())
+        // filter clients based on name
+            .filter(|(name, client)| name.to_owned().to_owned() == cname)
+            .next()
+            .expect(&format!("could not find client with name {}", cname));
 
-    let (config, device) = client.get_devices().expect("could not get devices!").into_iter().filter(|(config, device)| device.name().expect("could not get device name!") == dname).next().expect(&format!("could not find device with name {} on client {}", dname, cname));
+    let device = 
+        cpal::default_host()
+            .input_devices()
+            .expect("could not get devices!")
+            .into_iter()
+            .filter(|device| device.name().expect("could not get device name!") == dname)
+            .next()
+            .expect(&format!("could not find device with name {} on client {}", dname, cname));
 
-
-    client.change_device(&device, config).await;
+    client.change_source_device(device);
 
     return Ok(());
 }
 
 #[tauri::command]
-async fn client_input_device_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, name: String) -> Result<Vec<String>, String> {
+async fn client_input_device_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, dname: String) -> Result<Vec<String>, String> {
     println!("calling client_input_device_list");
 
     // ask client for devices
     let ul_state = state.lock().await;
-    let connections = ul_state.client_server_connections.lock().await;
+    let mut connections = ul_state.client_server_connections.lock().await;
 
-    let client = connections
+    let (_, client) = 
+        // get names of everything because async restrictions
+        futures::future::join_all(connections
+            .iter_mut()
+            .map(|client| client.name())
+        )
+        .await
         .iter()
-        .filter(|client| client.name == name)
-        .next()
-        .expect(&format!("no device found with name {}", name));
+        // pair names to client objets
+        .zip(connections.iter_mut())
+        // filter clients based on name
+            .filter(|(name, client)| name.to_owned().to_owned() == dname)
+            .next()
+            .expect(&format!("could not find client with name {}", dname));
 
-    Ok(client
-        .get_devices()
+    Ok(cpal::default_host()
+        .input_devices()
         .expect("could not get devices!")
-        .iter()
-        .map(|(_, device)| device.name().expect("could not get device name!"))
+        .map(|device| device.name().expect("could not get device name!"))
         .collect::<Vec<String>>()
     )
 }
@@ -139,19 +188,18 @@ async fn client_input_device_list(state: tauri::State<'_, Arc<Mutex<ProgramState
 #[tauri::command]
 async fn client_list(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
     let ul_state = state.lock().await;
-    let connections = ul_state.client_server_connections.lock().await;
+    let mut connections = ul_state.client_server_connections.lock().await;
 
-    Ok(connections
-        .iter()
-        .map(|client| client.name.clone())
-        .collect::<Vec<String>>()
-    )
+    Ok(futures::future::join_all(connections
+        .iter_mut()
+        .map(|client| client.name())
+    ).await)
 }
 
 
 #[derive(Default)]
 pub struct ProgramState {
-    client_server_connections: Arc<Mutex<Vec<remoteio_backend::client::Client>>>,
+    client_server_connections: Arc<Mutex<Vec<remoteio_backend::client::Metal2RemoteClient>>>,
     server_state: Arc<Mutex<remoteio_backend::server::Server>>,
 }
 
@@ -170,36 +218,37 @@ async fn main() {
             client_server_connections: Arc::new(Mutex::new(Vec::new())),
             server_state: Arc::new(Mutex::new(server_state)),
     }));
-    let check_state = Arc::clone(&state);
-
-
-    // clean up dead clients
-    tokio::spawn(async move {
-
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        
-        loop {
-            let ul_check_state = &mut check_state.lock().await;
-            let ul_client_server_connections = &mut ul_check_state.client_server_connections.lock().await;
-
-            // let mut to_retain = 
-            //     futures::future::join_all(
-            //         ul_client_server_connections
-            //         .iter_mut()
-            //         .map(|connection| connection.is_alive())
-            //     )
-            //     .await
-            //     .iter()
-            // ;
     
-            ul_client_server_connections.retain(|client| client.is_alive());
+    // let check_state = Arc::clone(&state);
 
-            println!("liveness: {}", ul_client_server_connections.iter().map(|client| format!("{}:{}", client.name, client.is_alive())).collect::<Vec<String>>().join(","));
 
-            interval.tick().await;
-        }
+    // // clean up dead clients
+    // tokio::spawn(async move {
 
-    });
+    //     let mut interval = tokio::time::interval(Duration::from_secs(1));
+        
+    //     loop {
+    //         let ul_check_state = &mut check_state.lock().await;
+    //         let ul_client_server_connections = &mut ul_check_state.client_server_connections.lock().await;
+
+    //         let to_retain_vec = futures::future::join_all(
+    //                 ul_client_server_connections
+    //                 .iter_mut()
+    //                 .map(|connection| connection.is_alive())
+    //             ).await;
+
+    //         let mut to_retain = to_retain_vec.iter();
+
+
+    
+    //         ul_client_server_connections.retain(|client| match to_retain.next() {Some(b) => b.to_owned(), None => panic!("should not happen")});
+
+    //         println!("live clients: {}", ul_client_server_connections.iter().map(|client| format!("{}", client.name)).collect::<Vec<String>>().join(","));
+
+    //         interval.tick().await;
+    //     }
+
+    // });
 
 
     tauri::Builder::default()

@@ -3,6 +3,8 @@ use std::time::Duration;
 use std::{convert::TryInto, slice::from_mut};
 
 use std::sync::{Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -18,206 +20,172 @@ use futures::sink::Send;
 
 use futures::{StreamExt, SinkExt};
 
-struct Connection {
+
+
+#[async_trait]
+pub trait Client {
+    async fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>>;
+    async fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
+    async fn is_alive(&mut self) -> bool;
+    async fn name(&mut self) -> String;
+    
+}
+
+pub struct Connection {
     url: String,
     writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    config: cpal::SupportedStreamConfig
+}
+pub struct Batch<T> {
+    pub repr: Vec<T>
 }
 
-impl Connection {
-    async fn connect_to_server(url: &str, config: cpal::SupportedStreamConfig) -> Result<(Connection, Response), Box<dyn std::error::Error>> {
-        println!("connecting to server {}", url);
+pub struct Metal2RemoteStream {
+    stream: cpal::Stream,
+    liveness: Arc<AtomicBool>,
+}
+
+pub struct Metal2RemoteClient {
+    connection: Option<Arc<Mutex<Connection>>>,
+    stream: Option<Metal2RemoteStream>,
+    device: cpal::Device
+}
+
+unsafe impl std::marker::Send for Metal2RemoteClient {}
+unsafe impl std::marker::Send for Connection {}
+
+impl Metal2RemoteClient {
+    pub fn new(device: cpal::Device) -> Self {
+        Self {
+            connection: None,
+            stream: None,
+            device,
+        }
+    }
+}
+
+struct ClientHelper {}
+
+impl ClientHelper {
+    fn build_input_stream(device: &cpal::Device, config: cpal::SupportedStreamConfig, input_stream_connection: Arc<Mutex<Connection>>, stream_liveness: Arc<AtomicBool>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+        let stream = device
+            .build_input_stream(
+                &config.into(),
+                move |data: &[f32], _| {
+                    let bytes = data.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
+                    
+                    let runtime = tokio::runtime::Runtime::new().expect("could not create runtime!");
+                    
+                    runtime.block_on(async {
+                        let mut connection = input_stream_connection.lock().await;
+
+                        match connection.writer.send(Message::binary(bytes)).await {
+                            Ok(_) => {},
+                            Err(e) => {
+                                stream_liveness.store(false, Ordering::Relaxed);
+                            },
+                        } 
+                    })
+                },
+                |err| eprintln!("errored in input stream {}", err),
+                Some(Duration::from_secs(5))
+            ).unwrap();
+
+        Ok(stream)
+    }
+}
+
+#[async_trait]
+impl Client for Metal2RemoteClient {
+    async fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
+        self.device = new_device;
+
+        let config = self.device.default_input_config().expect("could not get default input config!");
+
+        let input_stream_connection = Arc::clone(self.connection.as_ref().unwrap());
+
+        let liveness: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+        let stream_liveness: Arc<AtomicBool> = Arc::clone(&liveness);
+
+        let stream = ClientHelper::build_input_stream(&self.device, config, input_stream_connection, stream_liveness).expect("could not build input stream!");
+
+        self.stream = Some(Metal2RemoteStream {
+            stream,
+            liveness
+        });
+
+        Ok(())
+    }
+
+
+
+
+    async fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+       
+        // first establish connection
         let (socket, resp) = connect_async(url).await?;
-        println!("got connection!");
-        let (writer, reader) = socket.split();
-        
-        let connection = Connection {
-         url: url.to_owned(),
-         writer,
-         reader,
-         config
-        };
+        let (mut writer, reader) = socket.split();
 
-     
-        return Ok((connection, resp));
-     }
+        //then send config
+        let config = self.device.default_input_config().expect("could not get default input device!");
 
 
-     async fn send_client_config(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
         let bin_config_struct = crate::BinStreamConfig {
-            channels:  connection.config.channels(),
-            sample_rate: connection.config.sample_rate().0,
+            channels:  config.channels(),
+            sample_rate: config.sample_rate().0,
             buffer_size: 4096
         };
     
         let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(bin_config_struct))?;
     
-        connection.writer.send(Message::binary(bin_config)).await.expect("error sending config!");
-    
+        writer.send(Message::binary(bin_config)).await.expect("error sending config!");
+
+        // remember to store connection in self
+        let mut connection = Connection {
+            url: url.to_owned(),
+            writer,
+            reader
+        };
+
+        let self_connection = Arc::new(Mutex::new(connection));
+        let input_stream_connection = Arc::clone(&self_connection);
+
+        self.connection = Some(self_connection);
+
+        let liveness: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+        let stream_liveness: Arc<AtomicBool> = Arc::clone(&liveness);
+
+        //then set up stream
+        let stream = ClientHelper::build_input_stream(&self.device, config, input_stream_connection, stream_liveness).expect("could not build input stream!");
+
+        self.stream = Some(Metal2RemoteStream {
+            stream,
+            liveness
+        });
+
         Ok(())
     }
 
-    pub async fn new(url: &str, config: cpal::SupportedStreamConfig) -> Result<Connection, Box<dyn std::error::Error>> {
-        let (mut connection, _response) = Connection::connect_to_server(url, config).await?;
+    async fn is_alive(&mut self) -> bool {
 
-        Connection::send_client_config(&mut connection).await?;
+        match &self.stream {
+            Some(stream) => stream.liveness.load(Ordering::Relaxed),
+            None => false
 
-        Ok(connection)
-    }
-}
-#[derive(Clone)]
-pub enum AudioLinkStatus {
-    Alive,
-    Dead
-}
-struct AudioLink {
-    stream: cpal::Stream,
-    reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    status: Arc<Mutex<AudioLinkStatus>>
-}
-
-impl AudioLink {
-    async fn create_remote_audio_link(connection: Connection, input_device: &cpal::Device) -> Result<AudioLink, Box<dyn std::error::Error>> {
-        let Connection { url, mut writer, reader, config } = connection;
-        let status = Arc::new(Mutex::new(AudioLinkStatus::Alive));
-        let status_stream = Arc::clone(&status);
-
-        let stream = input_device
-            .build_input_stream(&config.into(), move |data: &[f32], _| {
-                let bytes = data.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
-    
-                let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
-    
-                runtime.block_on(async {
-                    match writer.send(Message::binary(bytes)).await {
-                        Ok(msg) => {},
-                        Err(e) => {
-                            let mut ul_status_stream = status_stream.lock().await;
-                            *ul_status_stream = AudioLinkStatus::Dead;
-                        }
-                    }
-                });
-           
-            }, |err| eprintln!("audio stream error: {}", err),
-            Some(Duration::from_secs(5)))
-            .unwrap();
-    
-        return Ok(AudioLink {
-            stream,
-            reader,
-            status
-        });
-    }
-
-    pub async fn new(connection: Connection, input_device: &cpal::Device) -> Result<AudioLink, Box<dyn std::error::Error>> {
-        return AudioLink::create_remote_audio_link(connection, input_device).await;
-    }
-}
-
-
-
-async fn obtain_input_device() -> Result<(cpal::SupportedStreamConfig, cpal::Device), Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
-    let input_device = host.default_input_device().expect("couldn't find default input device!");
-    let config = input_device.default_input_config()?;
-
-    return Ok((config, input_device));
-}
-
- 
-pub struct Client {
-    audio_link: AudioLink,
-    pub name: String,
-    pub url: String
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        println!("dropping {}", self.name);
-        let _ = self.audio_link.stream.pause();
-    }
-}
-
-impl Display for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Client({})", self.name)
-    }
-}
-
-// my first step into unsafe. Fuck.
-unsafe impl core::marker::Send for Client {}
-
-impl Client {
-    pub async fn new_with(url: &str, device: &cpal::Device, config: cpal::SupportedStreamConfig) -> Result<Client, Box<dyn std::error::Error>> {
-        // get connection
-        let connection = Connection::new(url.clone(), config).await?;
-
-        // create stream where every float is send to the server
-        let audio_link = AudioLink::new(connection, device).await?;
-
-        audio_link.stream.play().unwrap(); 
-
-        return Ok(Client {
-            name: url.to_owned(),
-            url: url.to_owned(),
-            audio_link,
-        });
-    }
-    pub async fn new(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
-        let (config, input_device) = obtain_input_device().await?;
-
-        return Client::new_with(url, &input_device, config).await;
-    }
-
-    pub async fn change_device(&mut self, device: &cpal::Device, config: cpal::SupportedStreamConfig) {
-
-        *self = Client::new_with(&self.url, device, config).await.expect("could not change device!");
-    }
-
-    pub fn get_devices(&self) -> Result<Vec<(cpal::SupportedStreamConfig, cpal::Device)>, Box<dyn std::error::Error>> {
-
-        Ok(cpal::default_host()
-            .input_devices()
-            .expect("could not get input devices")
-            .map(|device| (device.default_input_config().expect("could not get default input config!"), device))
-            .collect::<Vec<(cpal::SupportedStreamConfig, cpal::Device)>>()
-        )
-    }
-
-    pub async fn next_message(&mut self) -> Result<Option<Message>, Box<dyn std::error::Error>> {
-        match self.audio_link.reader.next().await {
-            None => Ok(None),
-            Some(res) => 
-                match res {
-                    Ok(msg) => Ok(Some(msg)),
-                    Err(e) => panic!("when trying to get next message from audio_link, got: {}", e)
-                }
         }
     }
 
-    pub fn is_alive(&self) -> bool {
-        let check = self.audio_link.status.blocking_lock();
-        match *check {
-            AudioLinkStatus::Alive => true,
-            AudioLinkStatus::Dead => false
-        }
+    async fn name(&mut self) -> String {
+        let device_name = match self.device.name() {
+            Ok(name) => name,
+            Err(e) => "N/A".to_owned()
+        };
+
+        let url = match &self.connection {
+            Some(connection) => connection.lock().await.url.clone(),
+            None => "N/A".to_owned()
+        };
+
+        format!("{device_name}:{url}")
     }
 }
-
-
-
-
-// #[tokio::main]
-// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//     let config = &remoteio_shared::config;
-    
-//     let mut client = Client::new(&config.ws_endpoint).await?;
-
-//     while let Ok(Some(msg)) = client.next_message().await {
-//         println!("Received message: {}", msg);
-//     }
-    
-
-//     Ok(())
-// }
