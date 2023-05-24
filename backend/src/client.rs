@@ -64,6 +64,21 @@ impl Metal2RemoteClient {
     }
 }
 
+impl Drop for Metal2RemoteClient {
+    fn drop(&mut self) {
+        match &self.connection {
+            Some(connection) => {
+                let spawn_connection = Arc::clone(connection);
+                tokio::task::spawn(async move {
+                    let mut ul_connection = spawn_connection.lock().await;
+                    ul_connection.writer.close().await.expect("could not close websocket!");
+                });
+            },
+            None => {}
+        }
+    }
+}
+
 struct ClientHelper {}
 
 impl ClientHelper {
@@ -76,9 +91,9 @@ impl ClientHelper {
                     
                     let runtime = tokio::runtime::Runtime::new().expect("could not create runtime!");
                     
+                    let mut connection = input_stream_connection.blocking_lock();
+                    
                     runtime.block_on(async {
-                        let mut connection = input_stream_connection.lock().await;
-
                         match connection.writer.send(Message::binary(bytes)).await {
                             Ok(_) => {},
                             Err(e) => {

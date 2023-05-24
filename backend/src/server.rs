@@ -1,4 +1,4 @@
-use std::convert::TryInto;
+pub use std::convert::TryInto;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc};
 use std::time::Duration;
@@ -19,494 +19,456 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-use futures::{FutureExt, StreamExt, Future};
+use futures::{FutureExt, StreamExt, Future, SinkExt};
 
 
-// Creates a cpal audio stream pulling from some SyncAudioStream
-fn spawn_audio_stream(config: &StreamConfig, audio_data_stream: Arc<Mutex<(impl SyncAudioStream + std::marker::Sync + std::marker::Send + 'static)>>, output_device: &mut cpal::Device, liveness: Arc<Mutex<ClientStatus>>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-    
-    let audio_stream = output_device
-    .build_output_stream(
-        config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            
-            let mut ul_audio_data_stream = audio_data_stream.blocking_lock();
-            let next = match ul_audio_data_stream.get_next_batch() {
-                Some(next) => next,
-                None => {
-                    *liveness.blocking_lock() = ClientStatus::Dead;
-                    return
+pub static BUFFER_BATCH_SIZE: usize = 4056;
+
+struct Concurrent {}
+
+impl Concurrent {
+    pub async fn lock_all_ordered<D>(to_locks: impl Iterator<Item = impl Future<Output=D>>) -> Vec<D> {
+        let mut locked = vec![];
+        for lock in to_locks.into_iter() {
+            locked.push(lock.await);
+        }
+
+
+        locked
+    }
+}
+
+// what does a server do
+// a server binds to a port and listens
+
+
+#[async_trait]
+pub trait Server {
+    async fn bind(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+    async fn list_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error>>;
+    async fn disconnect_client(&mut self, url: &str) -> Result<Option<Client>, Box<dyn std::error::Error>>;
+    async fn change_output_device(&mut self, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
+}
+pub struct MetalStream {
+    pub stream: cpal::Stream
+}
+
+impl MetalStream {
+    pub async fn new(connection: &Arc<Mutex<Connection>>) {
+
+        println!("locking on {}", line!());
+        let mut connection = connection.lock().await;
+        println!("left lock on {}", line!());
+
+        let output_stream_buffer = Arc::clone(&connection.buffer);
+        let error_stream_is_alive = Arc::clone(&connection.is_alive);
+
+
+        let stream = connection
+            .output_device
+            .build_output_stream(
+                &connection.config,
+                move |data: &mut [f32], _| {
+                    
+                    println!("locking on {}", line!());
+                    let mut buffer = output_stream_buffer.blocking_lock();
+                    println!("left lock on {}", line!());
+
+                    match buffer.next() {
+                        Some(b) => {
+                            for (b, d) in b.iter().zip(data.iter_mut()) {
+                                *d = b.to_owned();
+                            } 
+                        },
+                        None => {eprintln!("empty buffer!")}
+                    }
                 },
-            };
+                move |e| {
 
-            for (d, f) in data.into_iter().zip(next.iter()) {
-                
-                *d = f.clone();
-            }
+                    println!("locking on {}", line!());
+                    *error_stream_is_alive.blocking_lock() = false;
+                    println!("left lock on {}", line!());
+
+                    eprintln!("error in stream due to {e}");
+                },
+            Some(Duration::from_secs(5)),
+            )
+            .expect("could not create server output stream!");
+
+        connection.stream = Some(MetalStream { stream });
 
 
-        },
-        |err| eprintln!("audio stream error: {}", err),
-        Some(Duration::from_secs(5)),
-    )
-    .unwrap();
-
-    audio_stream.play().expect("couldnt play stream");
-
-    return Ok(audio_stream);
+    }
 }
 
 
-trait SyncAudioStream {
-    fn get_next_batch(&mut self) -> Option<Vec<f32>>;
+pub struct MetalServer {
+    connections: Arc<Mutex<Vec<Arc<Mutex<Connection>>>>>,
+    address: String
+}
+
+impl Default for MetalServer {
+    fn default() -> Self {
+        Self { connections: Default::default(), address: "0.0.0.0:8000".to_owned() }
+    }
+}
+
+impl MetalServer {
+    pub fn new(address: &str) -> Self {
+        MetalServer {
+            connections: Arc::new(Mutex::new(vec![])),
+            address: address.to_owned()
+        }
+    }
+}
+
+pub struct BatchBuffer<T> {
+    batch_size: usize,
+    buffer: Vec<T>
+}
+
+impl<T: Clone> BatchBuffer<T> {
+    pub fn new(batch_size: usize) -> BatchBuffer<T> {
+        BatchBuffer {
+            batch_size,
+            buffer: vec![]
+        }
+    }
+
+    pub fn next(&mut self) -> Option<Vec<T>> {
+        
+        let removed = self.buffer.get(0..self.batch_size)?.to_owned();
+
+        self.buffer.reverse();
+        self.buffer.truncate(self.batch_size);
+        self.buffer.reverse();
+
+        if removed.is_empty() {
+            return None;
+        } else {
+            return Some(removed);
+        }
+    }
+
+    pub fn extend(&mut self, iter: &mut dyn Iterator<Item = T>) {
+        self.buffer.extend(iter);
+    }
+
+    pub fn push(&mut self, to_push: T) {
+        self.buffer.push(to_push);
+    }
+}
+
+unsafe impl std::marker::Send for MetalServer {}
+unsafe impl std::marker::Send for Connection {}
+unsafe impl std::marker::Sync for Connection {}
+
+pub struct Connection {
+    client: Client,
+    output_device: cpal::Device,
+    buffer: Arc<Mutex<BatchBuffer<f32>>>,
+    stream: Option<MetalStream>,
+    config: StreamConfig,
+    websocket: WebSocketStream<TcpStream>,
+    is_alive: Arc<Mutex<bool>>
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        println!("dropping connection");
+
+        match &self.stream {
+            Some(stream) => {
+                let _ = stream.stream.pause();
+            },
+            None => {
+
+            }
+        }
+
+        let _ = self.websocket.close(None);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Client {
+    pub url: String,
+
+}
+
+impl Connection {
+    pub async fn new(address: &str, tcp_stream: TcpStream) -> Result<Arc<Mutex<Connection>>, Box<dyn std::error::Error>> {
+
+        let output_device = cpal::default_host().default_output_device().expect("could not find default input device!");
+        let client = Client {
+            url: address.to_owned()
+        };
+
+        let mut websocket = 
+            accept_async(tcp_stream)
+            .await
+            .expect("could not establish websocket stream!");
+
+        let config_message = 
+            websocket
+            .next()
+            .await
+            .expect("could not get config message!").expect("error getting config message!")
+            .into_data();
+
+        let bin_config = match bincode::deserialize(&config_message).expect("could not deserialize config!") {
+            crate::BinMessages::BinConfig(config) => config,
+            _ => panic!("unexpected message between client and server!")
+        };
+
+        let config = StreamConfig {
+            buffer_size: cpal::BufferSize::Fixed(bin_config.buffer_size), 
+            channels: bin_config.channels, 
+            sample_rate: cpal::SampleRate(bin_config.sample_rate)
+        };
+
+        let connection = Arc::new(Mutex::new(Connection {
+            client,
+            output_device,
+            websocket,
+            buffer: Arc::new(Mutex::new(BatchBuffer::new(BUFFER_BATCH_SIZE))),
+            stream: None,
+            config: config,
+            is_alive: Arc::new(Mutex::new(true)),
+        }));
+
+        MetalStream::new(&connection).await;
+
+        return Ok(connection);
+    }
 }
 
 #[async_trait]
-trait AsyncAudioStream {
-    async fn get_next_batch(&mut self) -> Option<Vec<f32>>;
-}
-
-struct RealOutputDevice {
-    buffer: Arc<Mutex<Vec<f32>>>,
-    device: cpal::Device
-}
-
-impl RealOutputDevice {
-    fn new(device: cpal::Device, config: &cpal::StreamConfig) -> (cpal::Stream, Self) {
-        let buffer = Arc::new(Mutex::new(vec![]));
-        let buffer_rx = Arc::clone(&buffer);
-
-        let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
+impl Server for MetalServer {
+    // spawn some task that runs the server connection in background
+    async fn bind(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(self.address.clone()).await.unwrap();
+        println!("Listening on: {}", self.address);
         
+        let connections = &mut self.connections;
+        let listener_connections = Arc::clone(&connections);
+        let liveness_connections = Arc::clone(&connections);
 
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                runtime.block_on(async {
-                    let mut buffer = buffer_rx.lock().await;
+        //async tasks
+        tokio::spawn(async move {
+            // remove dead connections
+            tokio::spawn(async move {
+                loop {
+                    println!("locking on {}", line!());
+                    let mut ul_connections = liveness_connections.lock().await;
+                    println!("left lock on {}", line!());
 
-                    buffer.append(&mut data.to_vec());
+                    println!("locking on {}", line!());
+                    let ul_connections_ul = Concurrent::lock_all_ordered(
+                        ul_connections
+                        .iter()
+                        .map(|connection| connection.lock())
+                    )
+                    .await;
+                    println!("left lock on {}", line!());
+                    
+
+                    let mut to_keep: Vec<bool> = vec![];
+
+                    for mut connection in ul_connections_ul {
+                        println!("locking on {}", line!());
+                        if *connection.is_alive.lock().await {
+                            to_keep.push(true);
+                        } else {
+                            to_keep.push(false);
+                            connection.stream = None;
+                        }
+                        println!("left lock on {}", line!())
+                    }
+
+                    // actual removal
+                    let mut keeper_iter = to_keep.iter();
+
+                    ul_connections.retain(|_| *keeper_iter.next().expect("error with iterator this should not happen!"));
+                }
+            });
+            // manage connections
+            loop {                
+                
+
+                let tcp_stream = match listener.accept().await {
+                    Ok((tcp_stream, _)) => tcp_stream,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        continue;
+                    }
+                };
+
+                println!("locking on {}", line!());
+                let mut ul_connections = listener_connections.lock().await;
+                println!("left lock on {}", line!());
+
+                let name = tcp_stream.peer_addr().unwrap().to_string();
+                
+                let connection = Connection::new(&name, tcp_stream).await.expect("could not create connection!");
+                let buffer_connection = Arc::clone(&connection);
+
+                //write data from websocket to buffer
+                tokio::spawn(async move {
+                    loop {
+                        println!("locking on {}", line!());
+                        let mut ul_connection = buffer_connection.lock().await;
+                        println!("left lock on {}", line!());
+
+                        match ul_connection.websocket.next().now_or_never() {
+                            Some(Some(Ok(message))) => {
+                                let message_data = 
+                                    message
+                                    .into_data()
+                                    .chunks(4)
+                                    .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("couldnt turn chunk into slice")))
+                                    .collect::<Vec<f32>>();
+
+                                ul_connection.buffer.lock().await.extend(&mut message_data.into_iter());
+
+                            },
+                            Some(Some(Err(e))) => {
+                                println!("locking on {}", line!());
+                                *ul_connection.is_alive.lock().await = false;
+                                println!("left lock on {}", line!());
+
+                                eprintln!("error writing server output due to {}", e);
+                                return;
+                            },
+                            Some(None) => {
+                                
+                                println!("locking on {}", line!());
+                                *ul_connection.is_alive.lock().await = false;
+                                println!("left lock on {}", line!());
+
+                                println!("Received None, stream is dead");
+                                return;
+                            },
+                            None => {
+                                continue;
+                            }
+                        }
+                    }
                 });
 
-            },
-            |_|{},
-            None
-        ).expect("couldnt build device output stream for real output device");
-
-        stream.play().expect("couldnt play stream for real output device");
 
 
-
-        return 
-            (stream, 
-            Self {
-                buffer: buffer,
-                device: device,
-            });
-        
-    }
-}
-
-#[async_trait]
-impl AsyncAudioStream for RealOutputDevice {
-    async fn get_next_batch(&mut self) -> Option<Vec<f32>> {
-        let mut buffer = self.buffer.lock().await;
-
-        if buffer.len() == 0 {
-            return None;
-        }
-
-        let clone = buffer.clone();
-        buffer.clear();
-
-        return Some(clone);
-    }
-}
-struct VirtualOutputDevice {
-    buffer: Arc<Mutex<Vec<f32>>>,
-    websocket: WebSocketStream<TcpStream>
-}
-
-impl VirtualOutputDevice {
-    fn new(websocket: WebSocketStream<TcpStream>) -> Self {
-        Self {
-            buffer: Arc::new(Mutex::new(vec![])),
-            websocket: websocket
-        }
-    }
-}
-
-
-impl SyncAudioStream for VirtualOutputDevice {
-    fn get_next_batch(&mut self) -> Option<Vec<f32>> {
-        let runtime = tokio::runtime::Runtime::new().expect("Unable to create a runtime");
-
-        let next_message = runtime.block_on(async { 
-            self.websocket
-                .next()
-                .await
+                
+                
+                ul_connections.push(connection);
+            }
         });
-
-            if let Some(Ok(message)) = next_message {
-
-                let mut buffer = self.buffer.blocking_lock();
-                
-                let mut message_data = 
-                    message.into_data()
-                                .chunks(4)
-                                .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("couldnt turn chunk into slice")))
-                                .collect::<Vec<f32>>();
-                
-                buffer.append(&mut message_data);
-
-                buffer.reverse();
-                buffer.truncate(1024);
-                buffer.reverse();
-            }
-
-            let mut buffer = self.buffer.blocking_lock();
-
-            if buffer.len() == 0 {
-                println!("buffer is empty from syncaudiostream!");
-                return None;
-            }
-
-            let clone = buffer.clone();
-            buffer.clear();
-
-            return Some(clone);
-        // })
-
         
-    }
-}
-#[async_trait]
-impl AsyncAudioStream for VirtualOutputDevice {
-    async fn get_next_batch(&mut self) -> Option<Vec<f32>> {
-        let next_message = 
-            self.websocket
-                .next()
-                .await;
-
-        if let Some(Ok(message)) = next_message {
-
-            let mut buffer = self.buffer.lock().await;
-
-            
-            let mut message_data = 
-                message.into_data()
-                            .chunks(4)
-                            .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("couldnt turn chunk into slice")))
-                            .collect::<Vec<f32>>();
-            
-            buffer.append(&mut message_data);
-
-            buffer.reverse();
-            buffer.truncate(1024);
-            buffer.reverse();
-        }
-
-        let mut buffer = self.buffer.lock().await;
-
-
-        if buffer.len() == 0 {
-            println!("buffer is empty from asyncaudiostream!");
-            return None;
-        }
-
-        let clone = buffer.clone();
-        buffer.clear();
-
-        return Some(clone);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum ClientStatus {
-    Alive,
-    Dead
-}
-pub struct Client {
-    pub name: String,
-    stream: cpal::Stream,
-    pub stream_status: Arc<Mutex<ClientStatus>>,
-    pub stream_config: cpal::StreamConfig,
-    virtual_output: Arc<Mutex<VirtualOutputDevice>>
-
-
-}
-
-
-
-
-unsafe impl core::marker::Send for Client {}
-
-pub struct ServerState {
-    pub clients: Arc<Mutex<Vec<Client>>>,
-    pub output_devices: Arc<Mutex<Vec<String>>>,
-    pub api_endpoint: String,
-    pub ws_endpoint: String,
-    pub current_device: Arc<Mutex<cpal::Device>>
-}
-
-impl Default for ServerState {
-    fn default() -> Self {
-        let default_output_device = cpal::default_host().default_output_device().expect("could not get default output device!");
-
-        Self { 
-            current_device: Arc::new(Mutex::new(default_output_device)),
-            clients: Default::default(),
-            output_devices: Default::default(),
-            api_endpoint: "http://0.0.0.0:8000".to_owned(),
-            ws_endpoint: "ws://0.0.0.0:80000".to_owned(),
-        }
-    }
-}
-
-
-impl Client {
-    pub async fn new(stream: TcpStream, device_name: &str) -> Result<Client, Box<dyn std::error::Error>> {
-        let mut virtual_device = Arc::new(Mutex::new(VirtualOutputDevice::new(accept_async(stream).await.unwrap())));
-        let mut ul_virtual_device = virtual_device.lock().await;
-
-        let name = ul_virtual_device.websocket.get_ref().peer_addr().unwrap();
-        println!(
-            "New WebSocket connection: {}",
-            name
-        );
-
-        let config_message = ul_virtual_device.websocket.next().await.expect("couldnt get config message!").expect("couldnt get config message!");
-        let config_data = config_message.into_data();
-        
-        let config_des = match bincode::deserialize(&config_data).expect("couldnt deserialize message!") {
-            crate::BinMessages::BinConfig(config_des) => config_des,
-            _ => panic!("config message not sent first!")
-        };
-
-        let config = cpal::StreamConfig {
-            channels: config_des.channels,
-            sample_rate: cpal::SampleRate(config_des.sample_rate), // Audio device default sample rate is set to 192000
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-
-        let host = cpal::default_host();
-        let mut output_device = host
-            .output_devices()
-            .unwrap()
-            .filter(|d|d.name().expect("could not get audio device name!") == device_name)
-            .next()
-            .expect(&format!("could not find audio device with name {}", device_name));
-
-        let liveness = Arc::new(Mutex::new(ClientStatus::Alive));
-        let stream_liveness = Arc::clone(&liveness);
-
-        let stream = spawn_audio_stream(&config, Arc::clone(&virtual_device), &mut output_device, stream_liveness)?;
-
-        return Ok(Client {name: name.to_string(), stream, stream_status: liveness, stream_config: config.clone(), virtual_output: Arc::clone(&virtual_device)});
-
-
-    } 
-}
-
-
-async fn audio_link_listener(program_state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(&program_state.ws_endpoint).await.unwrap();
-    println!("Listening on: {}", &program_state.ws_endpoint);
-    
-    while let Ok((tcp_stream, _)) = listener.accept().await {
-        let name = tcp_stream.peer_addr().unwrap().to_string();
-            
-        let client = Client::new(tcp_stream, &program_state.current_device.lock().await.name().expect("couldnt get device name!")).await?;
-
-        let mut ul_clients = program_state.clients.lock().await;
-        
-        ul_clients.push(client);
-    }
-
-    Ok(())
-}
-
-async fn audio_link_control(program_state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
-    
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    loop {
-
-        let program_state = Arc::clone(&program_state);
-        
-        let clients = &program_state.clients;
-        
-        let mut ul_clients = clients.lock().await;
-        
-        for client in ul_clients.iter_mut() {
-            let status = client.stream_status.lock().await;
-            match *status {
-                ClientStatus::Dead => {let _ = client.stream.pause();},
-                _ => {}
-            }
-        }
-        
-        // tokio::task::spawn_blocking(move || {
-        let statuses = 
-            futures::future::join_all(
-                ul_clients
-                        .iter_mut()
-                        .map(|client| client.stream_status.lock()))
-                        .await
-                        .iter()
-                        .map(|cs|ClientStatus::from(**cs))
-                        .collect::<Vec<ClientStatus>>();
-
-        let mut s_iter = statuses.iter();
-        
-        ul_clients.retain(
-            |_| {
-                match s_iter.next() {
-                    Some(ClientStatus::Alive) => true,
-                    _ => false
-                }
-            }
-        );
-        // }).await.expect("could not remove clients due to error");
-
-        println!("clients: {}", ul_clients.iter().map(|c| c.name.to_owned()).collect::<Vec<String>>().join(","));
-        interval.tick().await;
-        
-    }
-
-    Ok(())
-}
-
-async fn audio_link_main(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
-
-    let listener_state = Arc::clone(&state);
-
-    let control_state = Arc::clone(&state);
-
-    // audio stream creator / destroyer signal generator
-    tokio::spawn(async move {
-        let _ = audio_link_listener(listener_state).await; 
-    });
-
-    // creator / destroyer signal handler
-    tokio::spawn(async move {
-        let _ = audio_link_control(control_state).await;
-    });
-
-
-    Ok(())
-    
-}
-
-
-
-
-
-#[derive(Default)]
-pub struct Server {
-    pub server_state: Arc<ServerState>
-}
-
-impl Server {
-    pub async fn set_current_device(&mut self, dname: &str) -> Result<(), Box<dyn std::error::Error>> {
-
-        let mut ul_current_device = self.server_state.current_device.lock().await;
-
-
-        *ul_current_device =
-            cpal::default_host()
-            .output_devices()
-            .expect("could not get output devices")
-            .filter(|d|d.name().expect("could not get device name") == dname)
-            .next()
-            .expect(&format!("could not find device with name {}", dname));
-
-        // for every client, delete the old stream and create a new one with the new device
-        for client in self.server_state.clients.lock().await.iter_mut() {
-            *client.stream_status.lock().await = ClientStatus::Dead;
-            let _ = client.stream.pause();
-            
-            client.stream_status = Arc::new(Mutex::new(ClientStatus::Alive));
-
-
-            match spawn_audio_stream(
-                &client.stream_config, 
-                Arc::clone(&client.virtual_output), 
-                &mut ul_current_device, 
-                Arc::clone(&client.stream_status)
-            ) {
-                Ok(stream) => client.stream = stream,
-                Err(e) => panic!("error changing audio device!")
-            };
-
-            // spawn_audio_stream(config, audio_data_stream, output_device, liveness)
-        }
 
         Ok(())
     }
 
-    pub async fn new(api_endpoint: &str, ws_endpoint: &str, device: Option<String>) -> Result<Server, Box<dyn std::error::Error>> {
+    async fn list_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error>> {
+        println!("locking on {}", line!());
+        let connections = self.connections.lock().await;
+        let ret = Ok(Concurrent::lock_all_ordered(
+            connections
+            .iter()
+            .map(
+                |connection| connection.lock()
+            )
+        ).await
+        .iter()
+        .map(
+            |connection| connection.client.clone()
+        ).collect::<Vec<Client>>());
+        println!("left lock on {}", line!());
 
-        let output_devices = Arc::new(Mutex::new(vec![]));
-        let state_output_devices = Arc::clone(&output_devices);
+        return ret;
+    }
 
-        let device = match device {
-            Some(device) => cpal::default_host()
-                                        .output_devices()
-                                        .expect("could not get output devices")
-                                        .filter(|d|d.name().expect("could not get device name") == device)
-                                        .next()
-                                        .expect("could not find device!"),
+    async fn disconnect_client(&mut self, url: &str) -> Result<Option<Client>, Box<dyn std::error::Error>> {
+        println!("locking on {}", line!());
+        let mut ul_connections = self.connections.lock().await;
+        println!("left lock on {}", line!());
 
-            None => cpal::default_host().default_output_device().expect("could not get default output device!")
-        };
+        println!("locking on {}", line!());
+        let clients = 
+            Concurrent::lock_all_ordered(
+                ul_connections
+                .iter()
+                .map(|connection| connection.lock())
+            ).await
+            .iter()
+            .map(|connection| connection.client.clone())
+            .enumerate()
+            .collect::<Vec<(usize, Client)>>();
+        println!("left lock on {}", line!());
 
-        let state: Arc<ServerState> = 
-            Arc::new(
-                ServerState {
-                    clients: Arc::new(Mutex::new(vec![])), 
-                    api_endpoint: api_endpoint.to_owned(), 
-                    ws_endpoint: ws_endpoint.to_owned(), 
-                    output_devices: state_output_devices,
-                    current_device: Arc::new(Mutex::new(device))
-                }
-            );
-
-        let return_state = Arc::clone(&state);
-        let audio_link_state = Arc::clone(&state);
+        match clients.iter().find(|(_, client)| client.url == url) {
+            Some((i, client)) => {
         
-        // Links audio devices
-        tokio::spawn(async move {
-            let _ = audio_link_main(audio_link_state).await;
-        });
+                let removed = ul_connections.remove(i.to_owned());
+                println!("locking on {}", line!());
+                match &removed.lock().await.stream {
+                    Some(stream) => {let _ = stream.stream.pause();},
+                    None => {}
+                }
+                println!("left lock on {}", line!());
 
-        // keeps audio output devices up to date
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                let input_devices = 
-                cpal::default_host()
-                .output_devices()
-                .expect("could not get input devices!")
-                .map(|d| d.name().expect("could not get device name!"))
-                .collect::<Vec<String>>();
-            
-                *output_devices.lock().await = input_devices;
+                return Ok(Some(client.clone()));
+            },
+            None => {}
+        }
 
-                interval.tick().await;
+        return Ok(None);
+        
+        
+
+        
+    }
+
+    async fn change_output_device(&mut self, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
+        let new_name = new_output.name().expect("could not get device name!");
+
+        println!("locking on {}", line!());
+        let ul_connections = self.connections.lock().await;
+        println!("left lock on {}", line!());
+
+        // let ul_connections = Concurrent::lock_all_ordered(ul_connections.iter().map(|connection| connection.lock())).await;
+
+        for connection in ul_connections.iter() {
+
+            {
+                println!("locking on {}", line!());
+                let mut connection = connection.lock().await;
+                println!("left lock on {}", line!());
+                
+                match &connection.stream {
+                    Some(stream) => {let _ = stream.stream.pause();}
+                    None => {}
+                };
+    
+                connection.stream = None;
+    
+    
+                //"clone" device
+                let cloned_output = cpal::default_host()
+                    .output_devices()
+                    .expect("could not get output devices!")
+                    .filter(
+                        |device| device.name().expect("could not get device name!") == new_name
+                    ).next()
+                    .expect("could not find output device!");
+                
+                
+                connection.output_device = cloned_output;
             }
             
-        });
+            MetalStream::new(&connection).await;
+        }
 
-        // let _ = futures::join!(audio_control_future, audio_link_future);
-
-        return Ok(Server { server_state: return_state});
-    } 
+        Ok(())
+    }
 }
 
-// #[tokio::main]
-// async fn main() {
-//     let _ = Server::start(remoteio_shared::config.rest_endpoint, remoteio_shared::config.ws_endpoint).await;
-    
-    
-// }
