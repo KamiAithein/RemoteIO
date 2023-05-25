@@ -22,7 +22,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures::{FutureExt, StreamExt, Future, SinkExt};
 
 
-pub static BUFFER_BATCH_SIZE: usize = 4096;
+pub static BUFFER_BATCH_SIZE: usize = 1024;
 
 struct Concurrent {}
 
@@ -94,6 +94,8 @@ impl MetalStream {
             Some(Duration::from_secs(5)),
             )
             .expect("could not create server output stream!");
+
+        stream.play().expect("could not start server stream!");
 
         connection.stream = Some(MetalStream { stream });
 
@@ -334,9 +336,11 @@ impl Server for MetalServer {
 
                                 match deserialized {
                                     crate::BinMessages::BinData(data) => {
+                                        println!("received data: {data:?}");
                                         ul_connection.buffer.lock().await.extend(&mut data.into_iter());
                                     },
                                     crate::BinMessages::BinConfig(config) => {
+                                        println!("received config!");
                                         let config = cpal::StreamConfig {
                                             channels: config.channels,
                                             sample_rate: cpal::SampleRate(config.sample_rate),

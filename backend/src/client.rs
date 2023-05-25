@@ -106,6 +106,7 @@ impl ClientHelper {
                 Some(Duration::from_secs(5))
             ).unwrap();
 
+        stream.play().expect("could not start stream for client");
         Ok(stream)
     }
 }
