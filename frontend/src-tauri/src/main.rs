@@ -81,29 +81,14 @@ async fn connect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, addre
 }
 
 #[tauri::command]
-async fn client_disconnect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, client: String) -> Result<(), String> { 
+async fn client_disconnect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize) -> Result<(), String> { 
 
-    println!("client disconnect client {}", client);
+    println!("client disconnect client {}", cpos);
     let mut ul_state = state.lock().await;
 
     let connections = &mut ul_state.client_server_connections;
 
-    
-    let cnames =  
-        futures::future::join_all(
-            connections
-            .iter_mut()
-            .map(|connection|connection.name())
-        )
-        .await;
-
-    let mut to_keep =
-        cnames
-        .iter()
-        .map(|cname| cname.to_owned() != client)
-        .into_iter();
-
-        connections.retain(|_| to_keep.next().expect("this should never happen iterator error"));
+    let to_disconnect = connections.remove(cpos);
 
     Ok(())
 }
@@ -119,13 +104,14 @@ async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramSt
 }
 
 #[tauri::command]
-async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, dname: String) -> Result<(), String> {
+async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize, dname: String) -> Result<(), String> {
     let mut ul_state = state.lock().await;
+
+    let client = ul_state.client_server_connections.get_mut(cpos).expect("could not get client from tauri clients state");
     
-    for client in &mut ul_state.client_server_connections {
-        let device = cpal::default_host().input_devices().expect("could not get input devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find client input device!");
-        client.change_source_device(device).await.expect("could not change source device!");
-    }
+    let device = cpal::default_host().input_devices().expect("could not get input devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find client input device!");
+    client.change_source_device(device).await.expect("could not change source device!");
+
     
     Ok(())
 }

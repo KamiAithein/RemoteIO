@@ -42,8 +42,8 @@ function App() {
 
   }
 
-  async function clientDisconnectClient(client) {
-    return await invoke("client_disconnect_client", { client });
+  async function clientDisconnectClient(cpos) {
+    return await invoke("client_disconnect_client", { cpos });
 
   }
 
@@ -51,8 +51,8 @@ function App() {
     return await invoke("change_server_output_device", { dname });
   }
 
-  async function changeClientInputDevice(dname) { 
-    return await invoke("change_client_input_device", { dname });
+  async function changeClientInputDevice(cpos, dname) { 
+    return await invoke("change_client_input_device", { cpos, dname });
   }
 
   // clientInputList.map((item, index) => (
@@ -177,19 +177,19 @@ function App() {
 
           <ul>
             {
-              clientConnections.map((client) => (
+              clientConnections.map((client, ci) => (
                 <li>
                   <button>
                     {client}
                   </button>
-                  <button onClick = {() => clientDisconnectClient(client)}>
+                  <button onClick = {() => clientDisconnectClient(ci)}>
                     disconnect
                   </button>
                   <ul>
                     {
                       clientDevices.map((device) => (
                       <li>
-                        <button onClick = {() => changeClientInputDevice(device)}>
+                        <button onClick = {() => changeClientInputDevice(ci, device)}>
                           {device}
                         </button>
                       </li>
