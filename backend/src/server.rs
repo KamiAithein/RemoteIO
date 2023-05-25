@@ -336,7 +336,6 @@ impl Server for MetalServer {
 
                                 match deserialized {
                                     crate::BinMessages::BinData(data) => {
-                                        println!("received data: {data:?}");
                                         ul_connection.buffer.lock().await.extend(&mut data.into_iter());
                                     },
                                     crate::BinMessages::BinConfig(config) => {
