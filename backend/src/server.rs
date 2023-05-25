@@ -22,7 +22,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures::{FutureExt, StreamExt, Future, SinkExt};
 
 
-pub static BUFFER_BATCH_SIZE: usize = 1024;
+pub static BUFFER_BATCH_SIZE: usize = 4096;
 
 struct Concurrent {}
 
