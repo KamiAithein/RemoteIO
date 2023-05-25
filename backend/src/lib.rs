@@ -17,6 +17,7 @@ pub struct BinStreamConfig {
 pub enum BinMessages {
     BinHello,
     BinConfig(BinStreamConfig),
+    BinData(Vec<f32>),
     BinDevicesResponse(Vec<String>),
-    BinDevicesRequest
+    BinDevicesRequest,
 }

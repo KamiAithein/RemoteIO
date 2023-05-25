@@ -51,6 +51,10 @@ function App() {
     return await invoke("change_server_output_device", { dname });
   }
 
+  async function changeClientInputDevice(dname) { 
+    return await invoke("change_client_input_device", { dname });
+  }
+
   // clientInputList.map((item, index) => (
 //     <div>
 //     <button onClick={() => changeClientInputDevice(item)}>{item}</button>
@@ -183,7 +187,13 @@ function App() {
                   </button>
                   <ul>
                     {
-                      clientDevices.map((device) => (<li><button>{device}</button></li>))
+                      clientDevices.map((device) => (
+                      <li>
+                        <button onClick = {() => changeClientInputDevice(device)}>
+                          {device}
+                        </button>
+                      </li>
+                      ))
                     }
                   </ul>
                 </li>

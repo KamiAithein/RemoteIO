@@ -118,6 +118,18 @@ async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramSt
     Ok(())
 }
 
+#[tauri::command]
+async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, dname: String) -> Result<(), String> {
+    let mut ul_state = state.lock().await;
+    
+    for client in &mut ul_state.client_server_connections {
+        let device = cpal::default_host().input_devices().expect("could not get input devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find client input device!");
+        client.change_source_device(device).await.expect("could not change source device!");
+    }
+    
+    Ok(())
+}
+
 
 #[derive(Default)]
 pub struct ProgramState {
@@ -150,6 +162,7 @@ async fn main() {
             connect_client,
             client_disconnect_client,
             change_server_output_device,
+            change_client_input_device,
             ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

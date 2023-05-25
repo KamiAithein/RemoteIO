@@ -87,14 +87,14 @@ impl ClientHelper {
             .build_input_stream(
                 &config.into(),
                 move |data: &[f32], _| {
-                    let bytes = data.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
-                    
                     let runtime = tokio::runtime::Runtime::new().expect("could not create runtime!");
                     
                     let mut connection = input_stream_connection.blocking_lock();
-                    
+            
+                    let message = bincode::serialize(&crate::BinMessages::BinData(data.to_vec())).expect("could not serialize data");
+
                     runtime.block_on(async {
-                        match connection.writer.send(Message::binary(bytes)).await {
+                        match connection.writer.send(Message::binary(message)).await {
                             Ok(_) => {},
                             Err(e) => {
                                 stream_liveness.store(false, Ordering::Relaxed);
@@ -117,8 +117,27 @@ impl Client for Metal2RemoteClient {
 
         let config = self.device.default_input_config().expect("could not get default input config!");
 
-        let input_stream_connection = Arc::clone(self.connection.as_ref().unwrap());
+        //send new config to server
 
+        let bin_config_struct = crate::BinStreamConfig {
+            channels:  config.channels(),
+            sample_rate: config.sample_rate().0,
+            buffer_size: 4096
+        };
+    
+        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(bin_config_struct))?;
+        {
+            match &mut self.connection {
+                Some(connection) => {
+                    let mut ul_connection = connection.lock().await;
+                    ul_connection.writer.send(Message::binary(bin_config)).await.expect("error sending config!");
+                },
+                None => {}
+            }            
+        }
+        // establish new stream
+        
+        let input_stream_connection = Arc::clone(self.connection.as_ref().unwrap());
         let liveness: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
         let stream_liveness: Arc<AtomicBool> = Arc::clone(&liveness);
 
@@ -142,7 +161,7 @@ impl Client for Metal2RemoteClient {
         let (mut writer, reader) = socket.split();
 
         //then send config
-        let config = self.device.default_input_config().expect("could not get default input device!");
+        let config: cpal::SupportedStreamConfig = self.device.default_input_config().expect("could not get default input device!");
 
 
         let bin_config_struct = crate::BinStreamConfig {

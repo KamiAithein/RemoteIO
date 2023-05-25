@@ -22,7 +22,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures::{FutureExt, StreamExt, Future, SinkExt};
 
 
-pub static BUFFER_BATCH_SIZE: usize = 4056;
+pub static BUFFER_BATCH_SIZE: usize = 4096;
 
 struct Concurrent {}
 
@@ -56,9 +56,9 @@ pub struct MetalStream {
 impl MetalStream {
     pub async fn new(connection: &Arc<Mutex<Connection>>) {
 
-        println!("locking on {}", line!());
+        
         let mut connection = connection.lock().await;
-        println!("left lock on {}", line!());
+        
 
         let output_stream_buffer = Arc::clone(&connection.buffer);
         let error_stream_is_alive = Arc::clone(&connection.is_alive);
@@ -70,9 +70,9 @@ impl MetalStream {
                 &connection.config,
                 move |data: &mut [f32], _| {
                     
-                    println!("locking on {}", line!());
+                    
                     let mut buffer = output_stream_buffer.blocking_lock();
-                    println!("left lock on {}", line!());
+                    
 
                     match buffer.next() {
                         Some(b) => {
@@ -85,9 +85,9 @@ impl MetalStream {
                 },
                 move |e| {
 
-                    println!("locking on {}", line!());
+                    
                     *error_stream_is_alive.blocking_lock() = false;
-                    println!("left lock on {}", line!());
+                    
 
                     eprintln!("error in stream due to {e}");
                 },
@@ -259,31 +259,30 @@ impl Server for MetalServer {
             // remove dead connections
             tokio::spawn(async move {
                 loop {
-                    println!("locking on {}", line!());
+                    
                     let mut ul_connections = liveness_connections.lock().await;
-                    println!("left lock on {}", line!());
+                    
 
-                    println!("locking on {}", line!());
+                    
                     let ul_connections_ul = Concurrent::lock_all_ordered(
                         ul_connections
                         .iter()
                         .map(|connection| connection.lock())
                     )
                     .await;
-                    println!("left lock on {}", line!());
+                    
                     
 
                     let mut to_keep: Vec<bool> = vec![];
 
                     for mut connection in ul_connections_ul {
-                        println!("locking on {}", line!());
+                        
                         if *connection.is_alive.lock().await {
                             to_keep.push(true);
                         } else {
                             to_keep.push(false);
                             connection.stream = None;
                         }
-                        println!("left lock on {}", line!())
                     }
 
                     // actual removal
@@ -304,9 +303,9 @@ impl Server for MetalServer {
                     }
                 };
 
-                println!("locking on {}", line!());
+                
                 let mut ul_connections = listener_connections.lock().await;
-                println!("left lock on {}", line!());
+                
 
                 let name = tcp_stream.peer_addr().unwrap().to_string();
                 
@@ -316,35 +315,55 @@ impl Server for MetalServer {
                 //write data from websocket to buffer
                 tokio::spawn(async move {
                     loop {
-                        println!("locking on {}", line!());
+                        
                         let mut ul_connection = buffer_connection.lock().await;
-                        println!("left lock on {}", line!());
+                        
 
                         match ul_connection.websocket.next().now_or_never() {
-                            Some(Some(Ok(message))) => {
-                                let message_data = 
-                                    message
-                                    .into_data()
-                                    .chunks(4)
-                                    .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("couldnt turn chunk into slice")))
-                                    .collect::<Vec<f32>>();
+                            Some(Some(Ok(websocket_message))) => {
 
-                                ul_connection.buffer.lock().await.extend(&mut message_data.into_iter());
+                                let deserialized = match bincode::deserialize(&websocket_message.into_data()) {
+                                    Ok(deserialized) => deserialized,
+                                    Err(e) => {
+                                        eprintln!("could not deserialize client to server message on server due to {}", e);
+                                        continue;
+                                    }
+                                };
+
+
+
+                                match deserialized {
+                                    crate::BinMessages::BinData(data) => {
+                                        ul_connection.buffer.lock().await.extend(&mut data.into_iter());
+                                    },
+                                    crate::BinMessages::BinConfig(config) => {
+                                        let config = cpal::StreamConfig {
+                                            channels: config.channels,
+                                            sample_rate: cpal::SampleRate(config.sample_rate),
+                                            buffer_size: cpal::BufferSize::Fixed(config.buffer_size)
+                                        };
+
+                                        ul_connection.config = config;
+                                    },
+                                    _ => todo!("have not implemented this part of communication deserialization yet!")
+                                };
+
+                                
 
                             },
                             Some(Some(Err(e))) => {
-                                println!("locking on {}", line!());
+                                
                                 *ul_connection.is_alive.lock().await = false;
-                                println!("left lock on {}", line!());
+                                
 
                                 eprintln!("error writing server output due to {}", e);
                                 return;
                             },
                             Some(None) => {
                                 
-                                println!("locking on {}", line!());
+                                
                                 *ul_connection.is_alive.lock().await = false;
-                                println!("left lock on {}", line!());
+                                
 
                                 println!("Received None, stream is dead");
                                 return;
@@ -369,7 +388,7 @@ impl Server for MetalServer {
     }
 
     async fn list_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error>> {
-        println!("locking on {}", line!());
+        
         let connections = self.connections.lock().await;
         let ret = Ok(Concurrent::lock_all_ordered(
             connections
@@ -382,17 +401,17 @@ impl Server for MetalServer {
         .map(
             |connection| connection.client.clone()
         ).collect::<Vec<Client>>());
-        println!("left lock on {}", line!());
+        
 
         return ret;
     }
 
     async fn disconnect_client(&mut self, url: &str) -> Result<Option<Client>, Box<dyn std::error::Error>> {
-        println!("locking on {}", line!());
+        
         let mut ul_connections = self.connections.lock().await;
-        println!("left lock on {}", line!());
+        
 
-        println!("locking on {}", line!());
+        
         let clients = 
             Concurrent::lock_all_ordered(
                 ul_connections
@@ -403,18 +422,18 @@ impl Server for MetalServer {
             .map(|connection| connection.client.clone())
             .enumerate()
             .collect::<Vec<(usize, Client)>>();
-        println!("left lock on {}", line!());
+        
 
         match clients.iter().find(|(_, client)| client.url == url) {
             Some((i, client)) => {
         
                 let removed = ul_connections.remove(i.to_owned());
-                println!("locking on {}", line!());
+                
                 match &removed.lock().await.stream {
                     Some(stream) => {let _ = stream.stream.pause();},
                     None => {}
                 }
-                println!("left lock on {}", line!());
+                
 
                 return Ok(Some(client.clone()));
             },
@@ -431,18 +450,18 @@ impl Server for MetalServer {
     async fn change_output_device(&mut self, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
         let new_name = new_output.name().expect("could not get device name!");
 
-        println!("locking on {}", line!());
+        
         let ul_connections = self.connections.lock().await;
-        println!("left lock on {}", line!());
+        
 
         // let ul_connections = Concurrent::lock_all_ordered(ul_connections.iter().map(|connection| connection.lock())).await;
 
         for connection in ul_connections.iter() {
 
             {
-                println!("locking on {}", line!());
+                
                 let mut connection = connection.lock().await;
-                println!("left lock on {}", line!());
+                
                 
                 match &connection.stream {
                     Some(stream) => {let _ = stream.stream.pause();}
