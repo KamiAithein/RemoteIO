@@ -161,7 +161,6 @@ impl<T: Clone> BatchBuffer<T> {
     }
 }
 
-unsafe impl std::marker::Send for MetalServer {}
 unsafe impl std::marker::Send for Connection {}
 
 
