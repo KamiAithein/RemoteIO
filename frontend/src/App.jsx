@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/tauri";
 import "./App.css";
 
 import Tabs from "./components/Tabs"
+import Server from "./components/Server"
+import Client from "./components/Client"
 
 function App() {
   // const [greetMsg, setGreetMsg] = useState("");
@@ -18,7 +20,6 @@ function App() {
   const [serverDevices, setServerDevices] = useState(["i1, i2, i3"]);
   const [clientConnections, setClientConnections] = useState(["i1, i2, i3"]);
   const [clientDevices, setClientDevices] = useState(["i1, i2, i3"]);
-  const [activeClientText, setActiveClientText] = useState("ws://0.0.0.0:8000")
 
   async function getServerConnections() {
     return await invoke("get_server_connections");
@@ -51,71 +52,10 @@ function App() {
     return await invoke("change_server_output_device", { cpos, dname });
   }
 
-  async function changeClientInputDevice(cpos, dname) { 
+  async function changeClientInputDevice(cpos, dname) {
     return await invoke("change_client_input_device", { cpos, dname });
   }
 
-  // clientInputList.map((item, index) => (
-//     <div>
-//     <button onClick={() => changeClientInputDevice(item)}>{item}</button>
-//   </div>
-// ))}
-  // async function updateClientInputList(name) {
-  //   let list = await invoke("client_input_device_list", {name});
-
-  //   let oldClientInputList = clientInputList;
-  //   oldClientInputList[name] = list;
-    
-  //   setClientInputList(oldClientInputList);
-  // }
-
-  // async function getClientList() {
-  //   let list = await invoke("client_list");
-  //   console.log(list);
-  //   return list;
-  // }
-
-  // async function updateServerOutputList() {
-  //   let list = await invoke("server_output_device_list");
-  //   setServerOutputList(list);
-  // }
-
-  // async function updateClientServerList() {
-  //   let list = await invoke("client_server_list");
-  //   setClientServerList(list);
-  // }
-
-  // async function updateServerClientList() {
-  //   let list = await invoke("server_client_list");
-  //   setServerClientList(list);
-  // }
-
-  // async function changeServerOutputDevice(dname) {
-  //   await invoke("change_server_output_device", { dname })
-  // }
-
-  // async function changeClientInputDevice(cname, dname) {
-  //   await invoke("change_client_input_device", { cname, dname })
-  // }
-
-  // async function clientDisconnectServer(name) {
-  //   await invoke("client_disconnect_server", { name });
-  //   await updateClientServerList();
-  // }
-
-  // async function clientConnectServer(wsAddr) {
-  //   await invoke("client_connect_server", { wsAddr });
-  //   await updateClientServerList();
-  // }
-
-  // async function handleWSAddrChange(event) {
-  //   setWsAddr(event.target.value);
-  // }
-
-  // async function handleWSAddrConnect() {
-  //   await clientConnectServer(wsAddr);
-  //   await updateClientServerList();
-  // }
 
   useEffect(() => {
     async function update() {
@@ -126,7 +66,7 @@ function App() {
     }
 
     update();
-    
+
 
     const intervalId = setInterval(() => {
       update();
@@ -141,63 +81,24 @@ function App() {
     <div>
       <h1>Welcome to RemoteIO!</h1>
       <Tabs>
+
         <div label="Server">
-          <ul>
-            {
-              serverConnections.map((conn, cpos) => (
-                <li>
-                  <button>
-                    {conn}
-                  </button>
-                  <ul>
-                    {
-                      serverDevices.map((device) => (
-                      <li>
-                        <button onClick = {() => changeServerOutputDevice(cpos, device)}>
-                          {device}
-                        </button>
-                      </li>))
-                    }
-                  </ul>
-                </li>
-              ))
-            }
-            </ul>
-
-            
+          <Server
+            serverConnections={serverConnections}
+            serverDevices={serverDevices}>
+          </Server>
         </div>
-        <div label="Client">
-          {/*create a client*/}
-          <div>
-            <input onChange = {(e) => setActiveClientText(e.target.value)} value = {activeClientText}></input>
-            <button onClick = {() => connectClient(activeClientText)}>connect</button>
-          </div>
 
-          <ul>
-            {
-              clientConnections.map((client, ci) => (
-                <li>
-                  <button>
-                    {client}
-                  </button>
-                  <button onClick = {() => clientDisconnectClient(ci)}>
-                    disconnect
-                  </button>
-                  <ul>
-                    {
-                      clientDevices.map((device) => (
-                      <li>
-                        <button onClick = {() => changeClientInputDevice(ci, device)}>
-                          {device}
-                        </button>
-                      </li>
-                      ))
-                    }
-                  </ul>
-                </li>
-              ))
-            }
-          </ul>
+        <div label="Client">
+
+          <Client
+            clientConnections={clientConnections}
+            clientDevices={clientDevices}
+            connectClient={connectClient}
+            clientDisconnectClient={clientDisconnectClient}
+            changeClientInputDevice={changeClientInputDevice}>
+          </Client>
+
         </div>
       </Tabs>
     </div>
