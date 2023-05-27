@@ -47,7 +47,7 @@ pub trait Server {
     async fn bind(&mut self) -> Result<(), Box<dyn std::error::Error>>;
     async fn list_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error>>;
     async fn disconnect_client(&mut self, url: &str) -> Result<Option<Client>, Box<dyn std::error::Error>>;
-    async fn change_output_device(&mut self, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
+    async fn change_output_device(&mut self, cpos: usize, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
 }
 pub struct MetalStream {
     pub stream: cpal::Stream
@@ -163,7 +163,7 @@ impl<T: Clone> BatchBuffer<T> {
 
 unsafe impl std::marker::Send for MetalServer {}
 unsafe impl std::marker::Send for Connection {}
-unsafe impl std::marker::Sync for Connection {}
+
 
 pub struct Connection {
     client: Client,
@@ -450,45 +450,39 @@ impl Server for MetalServer {
         
     }
 
-    async fn change_output_device(&mut self, new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
+    async fn change_output_device(&mut self, cpos: usize,  new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
         let new_name = new_output.name().expect("could not get device name!");
 
         
-        let ul_connections = self.connections.lock().await;
-        
+        let mut ul_connections = self.connections.lock().await;
+        let rx_connection = ul_connections.get_mut(cpos).expect("could not get connection in change_output_device!");
 
-        // let ul_connections = Concurrent::lock_all_ordered(ul_connections.iter().map(|connection| connection.lock())).await;
-
-        for connection in ul_connections.iter() {
-
-            {
-                
-                let mut connection = connection.lock().await;
-                
-                
-                match &connection.stream {
-                    Some(stream) => {let _ = stream.stream.pause();}
-                    None => {}
-                };
-    
-                connection.stream = None;
-    
-    
-                //"clone" device
-                let cloned_output = cpal::default_host()
-                    .output_devices()
-                    .expect("could not get output devices!")
-                    .filter(
-                        |device| device.name().expect("could not get device name!") == new_name
-                    ).next()
-                    .expect("could not find output device!");
-                
-                
-                connection.output_device = cloned_output;
-            }
+        {
+            let mut connection = rx_connection.lock().await;
             
-            MetalStream::new(&connection).await;
+            
+            match &connection.stream {
+                Some(stream) => {let _ = stream.stream.pause();}
+                None => {}
+            };
+
+            connection.stream = None;
+
+
+            //"clone" device
+            let cloned_output = cpal::default_host()
+                .output_devices()
+                .expect("could not get output devices!")
+                .filter(
+                    |device| device.name().expect("could not get device name!") == new_name
+                ).next()
+                .expect("could not find output device!");
+            
+            
+            connection.output_device = cloned_output;
         }
+        
+        MetalStream::new(&rx_connection).await;
 
         Ok(())
     }

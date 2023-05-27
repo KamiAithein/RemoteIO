@@ -52,7 +52,6 @@ pub struct Metal2RemoteClient {
 }
 
 unsafe impl std::marker::Send for Metal2RemoteClient {}
-unsafe impl std::marker::Send for Connection {}
 
 impl Metal2RemoteClient {
     pub fn new(device: cpal::Device) -> Self {
