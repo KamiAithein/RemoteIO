@@ -94,11 +94,11 @@ async fn client_disconnect_client(state: tauri::State<'_, Arc<Mutex<ProgramState
 }
 
 #[tauri::command]
-async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, dname: String) -> Result<(), String> {
+async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize, dname: String) -> Result<(), String> {
     let device = cpal::default_host().output_devices().expect("could not get output devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find server output device!");
  
     let mut ul_state = state.lock().await;
-    ul_state.server_state.change_output_device(device).await.expect("could not change output device!");
+    ul_state.server_state.change_output_device(cpos, device).await.expect("could not change output device!");
 
     Ok(())
 }

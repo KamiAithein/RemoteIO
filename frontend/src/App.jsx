@@ -47,8 +47,8 @@ function App() {
 
   }
 
-  async function changeServerOutputDevice(dname) {
-    return await invoke("change_server_output_device", { dname });
+  async function changeServerOutputDevice(cpos, dname) {
+    return await invoke("change_server_output_device", { cpos, dname });
   }
 
   async function changeClientInputDevice(cpos, dname) { 
@@ -144,7 +144,7 @@ function App() {
         <div label="Server">
           <ul>
             {
-              serverConnections.map((conn) => (
+              serverConnections.map((conn, cpos) => (
                 <li>
                   <button>
                     {conn}
@@ -153,7 +153,7 @@ function App() {
                     {
                       serverDevices.map((device) => (
                       <li>
-                        <button onClick = {() => changeServerOutputDevice(device)}>
+                        <button onClick = {() => changeServerOutputDevice(cpos, device)}>
                           {device}
                         </button>
                       </li>))
@@ -169,10 +169,8 @@ function App() {
         <div label="Client">
           {/*create a client*/}
           <div>
-            <form onSubmit = {() => connectClient(activeClientText)}>
-              <input onChange = {(e) => setActiveClientText(e.target.value)} value = {activeClientText}></input>
-              <button type = 'submit'>connect</button>
-            </form>
+            <input onChange = {(e) => setActiveClientText(e.target.value)} value = {activeClientText}></input>
+            <button onClick = {() => connectClient(activeClientText)}>connect</button>
           </div>
 
           <ul>
