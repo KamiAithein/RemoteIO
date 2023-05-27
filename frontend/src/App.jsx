@@ -16,10 +16,10 @@ function App() {
   // const [clientInputList , setClientInputList ] = useState({"default": ["default"]});   
   // const [wsAddr, setWsAddr] = useState("");
 
-  const [serverConnections, setServerConnections] = useState(["i1, i2, i3"]);
-  const [serverDevices, setServerDevices] = useState(["i1, i2, i3"]);
-  const [clientConnections, setClientConnections] = useState(["i1, i2, i3"]);
-  const [clientDevices, setClientDevices] = useState(["i1, i2, i3"]);
+  const [serverConnections, setServerConnections] = useState([]);
+  const [serverDevices, setServerDevices] = useState([]);
+  const [clientConnections, setClientConnections] = useState([]);
+  const [clientDevices, setClientDevices] = useState([]);
 
   async function getServerConnections() {
     return await invoke("get_server_connections");
