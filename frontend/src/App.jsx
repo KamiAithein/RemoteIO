@@ -85,7 +85,8 @@ function App() {
         <div label="Server">
           <Server
             serverConnections={serverConnections}
-            serverDevices={serverDevices}>
+            serverDevices={serverDevices}
+            changeServerOutputDevice={changeServerOutputDevice}>
           </Server>
         </div>
 

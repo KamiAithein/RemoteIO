@@ -4,7 +4,8 @@ import PropTypes from 'prop-types';
 class Server extends Component {
     static propTypes = {
         serverConnections: PropTypes.instanceOf(Array).isRequired,
-        serverDevices: PropTypes.instanceOf(Array).isRequired
+        serverDevices: PropTypes.instanceOf(Array).isRequired,
+        changeServerOutputDevice: PropTypes.func.isRequired,
     };
 
 
@@ -13,7 +14,8 @@ class Server extends Component {
         const {
             props: {
                 serverConnections,
-                serverDevices
+                serverDevices,
+                changeServerOutputDevice
             },
         } = this;
 
