@@ -53,17 +53,28 @@ pub struct MetalStream {
     pub stream: cpal::Stream
 }
 
+impl Drop for MetalStream {
+    fn drop(&mut self) {
+        println!("dropping stream!");
+    }
+}
+
 impl MetalStream {
-    pub async fn new(connection: &Arc<Mutex<Connection>>) {
-
+    pub async fn new(connection: &mut Connection) {
         
-        let mut connection = connection.lock().await;
+        // Create a delay in case the input and output devices aren't synced.
+        let latency_frames = (150.0 / 1_000.0) * connection.config.sample_rate.0 as f32;
+        let latency_samples = latency_frames as usize * connection.config.channels as usize;
         
-
+        let mut buffer = BatchBuffer::new(BUFFER_BATCH_SIZE);
+        buffer.extend(&mut [0.0].repeat(latency_samples).into_iter());
+        
+        connection.buffer = Arc::new(Mutex::new(buffer));
+        connection.stream = None;
+        
         let output_stream_buffer = Arc::clone(&connection.buffer);
         let error_stream_is_alive = Arc::clone(&connection.is_alive);
-
-
+        
         let stream = connection
             .output_device
             .build_output_stream(
@@ -223,7 +234,7 @@ impl Connection {
         };
 
         let config = StreamConfig {
-            buffer_size: cpal::BufferSize::Fixed(bin_config.buffer_size), 
+            buffer_size: cpal::BufferSize::Default, 
             channels: bin_config.channels, 
             sample_rate: cpal::SampleRate(bin_config.sample_rate)
         };
@@ -238,7 +249,13 @@ impl Connection {
             is_alive: Arc::new(Mutex::new(true)),
         }));
 
-        MetalStream::new(&connection).await;
+        {
+            let ul_connection = &mut connection.lock().await;
+            ul_connection.stream = None;
+
+            MetalStream::new(ul_connection).await;
+        }
+
 
         return Ok(connection);
     }
@@ -342,10 +359,17 @@ impl Server for MetalServer {
                                         let config = cpal::StreamConfig {
                                             channels: config.channels,
                                             sample_rate: cpal::SampleRate(config.sample_rate),
-                                            buffer_size: cpal::BufferSize::Fixed(config.buffer_size)
+                                            buffer_size: cpal::BufferSize::Default
                                         };
 
-                                        ul_connection.config = config;
+                                        match &ul_connection.stream {
+                                            Some(stream) => {
+                                                stream.stream.pause().expect("could not pause server stream!");
+                                            }
+                                            None => {}
+                                        }
+
+                                        MetalStream::new(&mut ul_connection).await;
                                     },
                                     _ => todo!("have not implemented this part of communication deserialization yet!")
                                 };
@@ -449,10 +473,7 @@ impl Server for MetalServer {
         
     }
 
-    async fn change_output_device(&mut self, cpos: usize,  new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
-        let new_name = new_output.name().expect("could not get device name!");
-
-        
+    async fn change_output_device(&mut self, cpos: usize,  new_output: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {        
         let mut ul_connections = self.connections.lock().await;
         let rx_connection = ul_connections.get_mut(cpos).expect("could not get connection in change_output_device!");
 
@@ -466,22 +487,13 @@ impl Server for MetalServer {
             };
 
             connection.stream = None;
-
-
-            //"clone" device
-            let cloned_output = cpal::default_host()
-                .output_devices()
-                .expect("could not get output devices!")
-                .filter(
-                    |device| device.name().expect("could not get device name!") == new_name
-                ).next()
-                .expect("could not find output device!");
             
-            
-            connection.output_device = cloned_output;
+            connection.output_device = new_output;
+
+            connection.stream = None;
+            MetalStream::new(&mut connection).await;
         }
         
-        MetalStream::new(&rx_connection).await;
 
         Ok(())
     }
