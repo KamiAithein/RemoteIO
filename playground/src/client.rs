@@ -9,5 +9,5 @@ async fn main() {
 
 
     let _ = client.connect("ws://0.0.0.0:8000").await;
-    async_std::task::sleep(tokio::time::Duration::from_secs(10)).await;
+    // async_std::task::sleep(tokio::time::Duration::from_secs(10)).await;
 }

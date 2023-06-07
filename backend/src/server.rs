@@ -24,6 +24,8 @@ use futures::{FutureExt, StreamExt, Future, SinkExt};
 
 pub static BUFFER_BATCH_SIZE: usize = 4096;
 
+
+
 struct Concurrent {}
 
 impl Concurrent {
@@ -229,7 +231,7 @@ impl Connection {
             .into_data();
 
         let bin_config = match bincode::deserialize(&config_message).expect("could not deserialize config!") {
-            crate::BinMessages::BinConfig(config) => config,
+            crate::BinMessages::BinConfig(crate::AliasedData{alias, data}) => data,
             _ => panic!("unexpected message between client and server!")
         };
 
@@ -351,16 +353,18 @@ impl Server for MetalServer {
 
 
                                 match deserialized {
-                                    crate::BinMessages::BinData(data) => {
+                                    crate::BinMessages::BinData(crate::AliasedData{alias:_, data}) => {
                                         ul_connection.buffer.lock().await.extend(&mut data.into_iter());
                                     },
-                                    crate::BinMessages::BinConfig(config) => {
+                                    crate::BinMessages::BinConfig(crate::AliasedData{alias:_, data:config}) => {
                                         println!("received config!");
                                         let config = cpal::StreamConfig {
                                             channels: config.channels,
                                             sample_rate: cpal::SampleRate(config.sample_rate),
                                             buffer_size: cpal::BufferSize::Default
                                         };
+
+                                        ul_connection.config = config;
 
                                         match &ul_connection.stream {
                                             Some(stream) => {

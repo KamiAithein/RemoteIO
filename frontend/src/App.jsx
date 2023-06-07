@@ -82,7 +82,6 @@ function App() {
       <h1>Welcome to RemoteIO!</h1>
       <Tabs>
         <div label="Client">
-
           <Client
             clientConnections={clientConnections}
             clientDevices={clientDevices}
@@ -90,7 +89,6 @@ function App() {
             clientDisconnectClient={clientDisconnectClient}
             changeClientInputDevice={changeClientInputDevice}>
           </Client>
-
         </div>
 
         <div label="Server">

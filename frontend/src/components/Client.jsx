@@ -8,7 +8,8 @@ class Client extends Component {
         clientDevices: PropTypes.instanceOf(Array).isRequired,
         connectClient: PropTypes.func.isRequired,
         clientDisconnectClient: PropTypes.func.isRequired,
-        changeClientInputDevice: PropTypes.func.isRequired
+        changeClientInputDevice: PropTypes.func.isRequired,
+        
     };
 
     constructor(props) {
@@ -37,11 +38,14 @@ class Client extends Component {
 
         return (
             <div>
+
+                {/* connect */}
                 <div>
                     <input onChange={(e) => setActiveClientText(e.target.value)} value={this.state.activeClientText}></input>
                     <button onClick={() => connectClient(this.state.activeClientText)}>connect</button>
                 </div>
 
+                {/* connections */}
                 <ul>
                     {
                         clientConnections.map((client, ci) => (
@@ -67,6 +71,11 @@ class Client extends Component {
                         ))
                     }
                 </ul>
+
+                {/* logging */}
+                <div>
+
+                </div>
             </div>
         )
     }

@@ -17,3 +17,4 @@ serde = { version = "1.0.159", features = ["derive"] }
 async-trait = "0.1.68"
 axum = "0.6.18"
 remoteio-shared = { path = "../shared" }
+rand = "0.8.5"

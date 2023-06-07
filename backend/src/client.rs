@@ -6,7 +6,7 @@ use std::sync::{Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use cpal::StreamConfig;
+use cpal::{StreamConfig, SupportedBufferSize};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
@@ -51,7 +51,7 @@ pub struct Metal2RemoteClient {
     device: cpal::Device
 }
 
-unsafe impl std::marker::Send for Metal2RemoteClient {}
+unsafe impl std::marker::Send for Metal2RemoteStream {}
 
 impl Metal2RemoteClient {
     pub fn new(device: cpal::Device) -> Self {
@@ -90,7 +90,7 @@ impl ClientHelper {
                     
                     let mut connection = input_stream_connection.blocking_lock();
             
-                    let message = bincode::serialize(&crate::BinMessages::BinData(data.to_vec())).expect("could not serialize data");
+                    let message = bincode::serialize(&crate::BinMessages::BinData(crate::AliasedData {alias: crate::BinStreamAlias{alias: "N/A".to_owned()}, data: data.to_vec()})).expect("could not serialize data");
 
                     runtime.block_on(async {
                         match connection.writer.send(Message::binary(message)).await {
@@ -119,13 +119,18 @@ impl Client for Metal2RemoteClient {
 
         //send new config to server
 
+        let buffer_size = match config.buffer_size() {
+            SupportedBufferSize::Range { min, max } => max.to_owned(),
+            SupportedBufferSize::Unknown => 4096
+        };
+
         let bin_config_struct = crate::BinStreamConfig {
             channels:  config.channels(),
             sample_rate: config.sample_rate().0,
-            buffer_size: 4096
+            buffer_size
         };
     
-        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(bin_config_struct))?;
+        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(crate::AliasedData{alias: crate::BinStreamAlias{alias: "N/A".to_owned()}, data: bin_config_struct}))?;
         {
             match &mut self.connection {
                 Some(connection) => {
@@ -170,7 +175,7 @@ impl Client for Metal2RemoteClient {
             buffer_size: 4096
         };
     
-        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(bin_config_struct))?;
+        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(crate::AliasedData{alias: crate::BinStreamAlias {alias: "N/A".to_owned()}, data: bin_config_struct}))?;
     
         writer.send(Message::binary(bin_config)).await.expect("error sending config!");
 
