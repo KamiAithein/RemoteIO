@@ -51,7 +51,7 @@ impl<T: Clone + Sync + Send> Batch<T> {
 struct ServerHelper {}
 
 impl ServerHelper {
-    pub fn establish_audio_link(device: &cpal::Device, config: Option<cpal::StreamConfig>, alias: &str, streams: &mut HashMap<String, cpal::Stream>, batches: &mut HashMap<String, Batch<f32>>) {
+    pub fn establish_audio_link(device: &cpal::Device, config: Option<cpal::StreamConfig>, alias: &str, streams: &mut HashMap<String, Stream>, batches: &mut HashMap<String, Batch<f32>>) {
         let config = match config {
             Some(config) => config,
             None => device.default_output_config().expect("could not get output config!").into()
@@ -73,7 +73,7 @@ impl ServerHelper {
 
         stream.play().expect("could not play stream!");
 
-        streams.insert(alias.to_owned(), stream);
+        streams.insert(alias.to_owned(), Stream::from(stream));
         batches.insert(alias.to_owned(), batch);
     }
 }
@@ -85,11 +85,25 @@ pub trait SyncServer {
     fn new(addr: &str, device: Option<cpal::Device>) -> Result<Server, Box<dyn std::error::Error>>;
 }
 
+pub struct Stream {
+    stream: cpal::Stream
+}
+
+unsafe impl Send for Stream {}
+
+impl Stream {
+    pub fn from(stream: cpal::Stream) -> Stream {
+        return Stream {
+            stream
+        }
+    }
+}
+
 pub struct Server {
-    socket: UdpSocket,
-    streams: Arc<Mutex<HashMap<String, cpal::Stream>>>,
+    socket: Arc<Mutex<UdpSocket>>,
+    streams: Arc<Mutex<HashMap<String, Stream>>>,
     batches: Arc<Mutex<HashMap<String, Batch<f32>>>>,
-    device: Option<cpal::Device>
+    device: Option<Arc<cpal::Device>>
 }
 
 impl Server {
@@ -97,24 +111,103 @@ impl Server {
 }
 impl SyncServer for Server {
     fn new(addr: &str, mut device: Option<cpal::Device>) -> Result<Server, Box<dyn std::error::Error>> {
-        let socket = UdpSocket::bind("localhost:9000").expect("could not bind to udp socket!");
+        let socket = Arc::new(Mutex::new(UdpSocket::bind("localhost:9000").expect("could not bind to udp socket!")));
 
-        let streams = HashMap::<String, cpal::Stream>::new();
-        let batches = HashMap::<String, Batch<f32>>::new();
+        let streams = Arc::new(Mutex::new(HashMap::<String, Stream>::new()));
+        let batches = Arc::new(Mutex::new(HashMap::<String, Batch<f32>>::new()));
 
-        match device {
-            Some(_) => {},
+        let device = Arc::new(match device {
+            Some(d) => d,
             //auto initialize if no device given
-            None => {device = Some(cpal::default_host().default_output_device().expect("could not get default ouput device!")); }
-        }
+            None => cpal::default_host().default_output_device().expect("could not get default ouput device!")
+        });
+
+        let s_streams = Arc::clone(&streams);
+        let s_batches = Arc::clone(&batches);
+        let s_device = Arc::clone(&device);
+        let s_socket = Arc::clone(&socket);
 
         //new thread server main loop here
+        std::thread::spawn(move || {
+            loop {
+                let mut buf = ['\0' as u8 ; BUFFER_SIZE];
+                
+                let recv = {
+                    let ul_socket = socket.lock().expect("could not lock socket!");
+                    ul_socket.recv(&mut buf).expect("could not recv")
+                };
 
+                let buf = &buf[..recv];
+                
+                match bincode::deserialize(&buf).expect("could not deserialize!") {
+                    remoteio_backend::BinMessages::BinConfig(remoteio_backend::AliasedData{alias, data: config}) => {
+                        println!("config! {}, {}, {}", config.channels, config.sample_rate, config.buffer_size);
+                        let alias = alias.alias;
+                        println!("config is for alias {alias}");
+                        let config = cpal::StreamConfig {
+                            buffer_size: cpal::BufferSize::Default, 
+                            channels: config.channels, 
+                            sample_rate: cpal::SampleRate(config.sample_rate)
+                        };
+        
+                        // we have a new config from a new device from an old client. Change the config on the appropriate stream
+                        // first delete the old stream
+                        let mut ul_streams = streams.lock().expect("could not lock streams!");
+                        let mut ul_batches = batches.lock().expect("could not lock batches!");
+                        match ul_streams.remove(&alias) {
+                            None => todo!("got config for uninitialized stream!"),
+                            Some(_) => {}
+                        }
+        
+                        match ul_batches.remove(&alias) {
+                            
+                            None => {
+                                println!("still alias as {alias}");
+                                todo!("couldn't remove stream!");
+                            },
+                            Some(_) => {}
+                        }
+        
+                        ServerHelper::establish_audio_link(&device, Some(config), &alias, &mut ul_streams, &mut ul_batches);
+        
+                    },
+                    remoteio_backend::BinMessages::BinData(remoteio_backend::AliasedData{alias, data}) => {
+                        let mut ul_batches = batches.lock().expect("could not lock batches!");
+
+
+                        let alias = alias.alias;
+                        let batch = ul_batches.get_mut(&alias).expect("could not find batch!");
+                        println!("data: {:?}", &data[..3]);
+                        batch.put(data.clone().into_iter());
+                    },
+                    remoteio_backend::BinMessages::BinHello(remoteio_backend::BinStreamAlias{alias}) => {
+                        println!("hello message! {}", alias);
+                        let mut ul_batches = batches.lock().expect("could not lock batches!");
+                        let mut ul_streams = streams.lock().expect("could not lock streams!");
+
+
+        
+                        if ul_streams.contains_key(&alias) { //we already are connected to this client!
+                            // just delete the old client before we reinitialize
+                            ul_streams.remove(&alias);
+                            ul_batches.remove(&alias);
+                        }
+        
+                        ServerHelper::establish_audio_link(&device, None, &alias, &mut ul_streams, &mut ul_batches);
+                    }
+                    _ => todo!("unimplemented!")
+                };
+        
+            
+            }
+    
+        });
+        
         return Ok(Server {
-            socket,
-            device,
-            streams: Arc::new(Mutex::new(streams)),
-            batches: Arc::new(Mutex::new(batches)),
+            socket: s_socket,
+            device: Some(s_device),
+            streams: s_streams,
+            batches: s_batches,
         })
     }
 
@@ -149,72 +242,9 @@ impl SyncServer for Server {
 // the server needs to read who the message is from and to and then 
 //  distribute the message properly
 fn main() {
-    let socket = UdpSocket::bind("localhost:9000").expect("could not bind address!");
 
-
-    let mut streams = HashMap::<String, cpal::Stream>::new();
-    let mut batches = HashMap::<String, Batch<f32>>::new();
-
-    let device = cpal::default_host().default_output_device().expect("could not get default ouput device!");
-
-    loop {
-        let mut buf = ['\0' as u8 ; BUFFER_SIZE];
-        
-        let recv = socket.recv(&mut buf).expect("could not recv");
-        
-        let buf = &buf[..recv];
-        
-        match bincode::deserialize(&buf).expect("could not deserialize!") {
-            remoteio_backend::BinMessages::BinConfig(remoteio_backend::AliasedData{alias, data: config}) => {
-                println!("config! {}, {}, {}", config.channels, config.sample_rate, config.buffer_size);
-                let alias = alias.alias;
-                println!("config is for alias {alias}");
-                let config = cpal::StreamConfig {
-                    buffer_size: cpal::BufferSize::Default, 
-                    channels: config.channels, 
-                    sample_rate: cpal::SampleRate(config.sample_rate)
-                };
-
-                // we have a new config from a new device from an old client. Change the config on the appropriate stream
-                // first delete the old stream
-                match streams.remove(&alias) {
-                    None => todo!("got config for uninitialized stream!"),
-                    Some(_) => {}
-                }
-
-                match batches.remove(&alias) {
-                    
-                    None => {
-                        println!("still alias as {alias}");
-                        todo!("couldn't remove stream!");
-                    },
-                    Some(_) => {}
-                }
-
-                ServerHelper::establish_audio_link(&device, Some(config), &alias, &mut streams, &mut batches);
-
-            },
-            remoteio_backend::BinMessages::BinData(remoteio_backend::AliasedData{alias, data}) => {
-                // println!("data! {:?}", data);
-                let alias = alias.alias;
-                let batch = batches.get_mut(&alias).expect("could not find batch!");
-                println!("data: {:?}", &data[..3]);
-                batch.put(data.clone().into_iter());
-            },
-            remoteio_backend::BinMessages::BinHello(remoteio_backend::BinStreamAlias{alias}) => {
-                println!("hello message! {}", alias);
-
-                if streams.contains_key(&alias) { //we already are connected to this client!
-                    // just delete the old client before we reinitialize
-                    streams.remove(&alias);
-                    batches.remove(&alias);
-                }
-
-                ServerHelper::establish_audio_link(&device, None, &alias, &mut streams, &mut batches);
-            }
-            _ => todo!("unimplemented!")
-        };
+    let stream = Server::new("localhost:9000", None).expect("could not create server!");
+    loop {}
 
     
-    }
 }
