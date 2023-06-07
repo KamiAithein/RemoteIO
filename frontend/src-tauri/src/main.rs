@@ -1,11 +1,10 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{sync::Arc, time::Duration};
+use std::{sync::{Mutex, MutexGuard, Arc}, time::Duration};
 
-use remoteio_backend::client::Client;
+use remoteio_backend::{client::{Client, SyncClient}, server::SyncServer};
 use remoteio_backend::server::Server;
-use tokio::sync::{Mutex, MutexGuard};
 
 use cpal::{Device, traits::{DeviceTrait, HostTrait}};
 
@@ -21,14 +20,14 @@ fn greet(name: &str) -> String {
 #[tauri::command]
 async fn get_server_connections(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
 
-    let ul_state = state.lock().await;
+    let ul_state = state.lock().expect("Could not lock state!");
 
-    let clients = match ul_state.server_state.list_clients().await {
+    let clients = match ul_state.server_state.list_clients() {
         Ok(clients) => clients,
         Err(e) => panic!("panicking when getting server connections due to {}", e),
     };
 
-    return Ok(clients.iter().map(|client| client.url.clone()).collect::<Vec<String>>());
+    return Ok(clients.iter().map(|client| client.clone()).collect::<Vec<String>>());
 }
 
 
@@ -47,9 +46,9 @@ async fn get_server_devices(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -
 #[tauri::command]
 async fn get_client_connections(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -> Result<Vec<String>, String> {
     
-    let mut ul_state = state.lock().await;
+    let mut ul_state = state.lock().expect("Could not lock state!");
 
-    let names = futures::future::join_all(ul_state.client_server_connections.iter_mut().map(|client| client.name())).await;
+    let names = ul_state.client_server_connections.iter_mut().map(|client| client.name()).collect();
 
     return Ok(names);
 }
@@ -67,13 +66,14 @@ async fn get_client_devices(state: tauri::State<'_, Arc<Mutex<ProgramState>>>) -
 
 #[tauri::command]
 async fn connect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, address: String) -> Result<(), String> { 
-    let mut ul_state = state.lock().await;
+    let mut ul_state = state.lock().expect("Could not lock state!");
 
     //default device should be changed 
     let default_device = cpal::default_host().default_input_device().expect("could not get default input device!");
 
-    let mut client = remoteio_backend::client::Metal2RemoteClient::new(default_device);
-    client.connect(&address).await.expect("could not connect client to given address!");
+    //TODO what name??
+    let mut client = remoteio_backend::client::Client::new(&address, default_device);
+    client.connect(&address).expect("could not connect client to given address!");
 
     ul_state.client_server_connections.push(client);
 
@@ -84,7 +84,7 @@ async fn connect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, addre
 async fn client_disconnect_client(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize) -> Result<(), String> { 
 
     println!("client disconnect client {}", cpos);
-    let mut ul_state = state.lock().await;
+    let mut ul_state = state.lock().expect("Could not lock state!");
 
     let connections = &mut ul_state.client_server_connections;
 
@@ -97,37 +97,34 @@ async fn client_disconnect_client(state: tauri::State<'_, Arc<Mutex<ProgramState
 async fn change_server_output_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize, dname: String) -> Result<(), String> {
     let device = cpal::default_host().output_devices().expect("could not get output devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find server output device!");
  
-    let mut ul_state = state.lock().await;
-    ul_state.server_state.change_output_device(cpos, device).await.expect("could not change output device!");
+    let mut ul_state = state.lock().expect("Could not lock state!");
+    //TODO uncomment and fix thsi
+    // ul_state.server_state.change_output_device(cpos, device).expect("could not change output device!");
 
     Ok(())
 }
 
 #[tauri::command]
 async fn change_client_input_device(state: tauri::State<'_, Arc<Mutex<ProgramState>>>, cpos: usize, dname: String) -> Result<(), String> {
-    let mut ul_state = state.lock().await;
+    let mut ul_state = state.lock().expect("Could not lock state!");
 
     let client = ul_state.client_server_connections.get_mut(cpos).expect("could not get client from tauri clients state");
     
     let device = cpal::default_host().input_devices().expect("could not get input devices!").filter(|device| device.name().expect("could not get device name!") == dname).next().expect("could not find client input device!");
-    client.change_source_device(device).await.expect("could not change source device!");
+    client.change_source_device(device).expect("could not change source device!");
 
     
     Ok(())
 }
 
-
-#[derive(Default)]
 pub struct ProgramState {
-    client_server_connections: Vec<remoteio_backend::client::Metal2RemoteClient>,
-    server_state: remoteio_backend::server::MetalServer,
+    client_server_connections: Vec<remoteio_backend::client::Client>,
+    server_state: remoteio_backend::server::Server,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
 
-    let mut server_state = remoteio_backend::server::MetalServer::new("0.0.0.0:8000");
-    let _ = server_state.bind().await;
+    let server_state = remoteio_backend::server::Server::new("0.0.0.0:8000", None).expect("could not create server!");
 
     let state = 
         Arc::new(Mutex::new(ProgramState { 

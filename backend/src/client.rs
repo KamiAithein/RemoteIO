@@ -1,123 +1,107 @@
-use std::fmt::Display;
-use std::time::Duration;
-use std::{convert::TryInto, slice::from_mut};
+use std::{sync::{Arc, Mutex}, net::{UdpSocket, Ipv4Addr, Ipv6Addr}};
 
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicBool, Ordering};
-use async_trait::async_trait;
-use tokio::sync::Mutex;
-use cpal::{StreamConfig, SupportedBufferSize};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use bytes::Bytes;
-use futures::stream::{SplitSink, SplitStream};
-use serde::Serialize;
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::handshake::client::Response;
-use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
-use futures::sink::Send;
+use cpal::{traits::*, SupportedBufferSize};
 
-
-use futures::{StreamExt, SinkExt};
-
-
-
-#[async_trait]
-pub trait Client {
-    async fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>>;
-    async fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
-    async fn is_alive(&mut self) -> bool;
-    async fn name(&mut self) -> String;
-    
+pub trait SyncClient {
+    fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>>;
+    fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>>;
+    fn is_alive(&mut self) -> bool;
+    fn name(&mut self) -> String;
 }
 
-pub struct Connection {
-    url: String,
-    writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-}
-pub struct Batch<T> {
-    pub repr: Vec<T>
-}
-
-pub struct Metal2RemoteStream {
-    stream: cpal::Stream,
-    liveness: Arc<AtomicBool>,
-}
-
-pub struct Metal2RemoteClient {
+pub struct Client {
+    name: String,
+    is_alive: Arc<Mutex<bool>>,
     connection: Option<Arc<Mutex<Connection>>>,
-    stream: Option<Metal2RemoteStream>,
-    device: cpal::Device
+    device: Option<cpal::Device>
 }
 
-unsafe impl std::marker::Send for Metal2RemoteStream {}
-
-impl Metal2RemoteClient {
-    pub fn new(device: cpal::Device) -> Self {
-        Self {
+impl Client {
+    pub fn new(name: &str, device: cpal::Device) -> Client {
+        Client {
+            name: name.to_owned(),
+            is_alive: Arc::new(Mutex::new(false)),
             connection: None,
-            stream: None,
-            device,
+            device: Some(device)
         }
     }
+
+    fn establish_audio_link(&mut self, alias: String, config: cpal::SupportedStreamConfig, stream_connection: Arc<Mutex<Connection>>) -> cpal::Stream {
+        let stream_name = alias.clone();
+        let stream = self.device.as_ref().expect("no audio device selected at connect!").build_input_stream(
+            &config.into(), 
+            move |data: &[f32], _| {
+        
+                let data_chunks = data.chunks(128).map(|chunk| chunk.to_owned());
+                for data in data_chunks {
+                    let to_send = crate::BinMessages::BinData(crate::AliasedData{alias: crate::BinStreamAlias{alias: stream_name.clone()}, data: data.to_vec()});
+                    let to_send_bin = bincode::serialize(&to_send).expect("could not serialize audio data!");
+    
+                    let ul_connection = stream_connection.lock().expect("could not lock stream connection!");
+                    // println!("sending audio data! {:?}", data);
+                    ul_connection.socket.send(&to_send_bin).expect("could not send audio data!");
+                    // println!("sent!");
+                }
+            }, 
+            |_| {
+                println!("error!");
+            }, 
+            None
+        ).expect("could not start input stream!");
+
+        stream.play().expect("could not start stream");
+        stream
+    }
 }
 
-impl Drop for Metal2RemoteClient {
-    fn drop(&mut self) {
-        match &self.connection {
-            Some(connection) => {
-                let spawn_connection = Arc::clone(connection);
-                tokio::task::spawn(async move {
-                    let mut ul_connection = spawn_connection.lock().await;
-                    ul_connection.writer.close().await.expect("could not close websocket!");
-                });
-            },
-            None => {}
+struct Connection {
+    socket: UdpSocket,
+    send_endpoint: String,
+    stream: Option<Stream>
+}
+
+pub struct Stream {
+    stream: cpal::Stream
+}
+
+unsafe impl Send for Stream {}
+
+impl SyncClient for Client {
+    // must have set device already!
+    fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.connection = None;
+
+        let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?;
+        println!("connected socket at {}", socket.local_addr().expect("couldnt get local addr"));
+        println!("trying to cnonect to {}", url);
+        socket.connect(url).expect("could not connect to server from client!");
+
+        {
+            let mut is_alive = self.is_alive.lock().expect(&format!("{}, could not lock is_alive on line", line!()));
+            *is_alive = true;
         }
-    }
-}
+        
+        let connection = Arc::new(Mutex::new(Connection {
+            socket,
+            send_endpoint: url.to_owned(),
+            stream: None
+        }));
 
-struct ClientHelper {}
+        self.connection = Some(Arc::clone(&connection));
+        
+        let alias = self.name();
 
-impl ClientHelper {
-    fn build_input_stream(device: &cpal::Device, config: cpal::SupportedStreamConfig, input_stream_connection: Arc<Mutex<Connection>>, stream_liveness: Arc<AtomicBool>) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-        let stream = device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _| {
-                    let runtime = tokio::runtime::Runtime::new().expect("could not create runtime!");
-                    
-                    let mut connection = input_stream_connection.blocking_lock();
-            
-                    let message = bincode::serialize(&crate::BinMessages::BinData(crate::AliasedData {alias: crate::BinStreamAlias{alias: "N/A".to_owned()}, data: data.to_vec()})).expect("could not serialize data");
+        {
+            let ul_connection = connection.lock().expect("could not get lock on connection!");
+            let bin_hello = bincode::serialize(&crate::BinMessages::BinHello(crate::BinStreamAlias { alias: alias.clone() })).expect("could not serialize hello message!");
+            ul_connection.socket.send(&bin_hello).expect("could not send hello!");
 
-                    runtime.block_on(async {
-                        match connection.writer.send(Message::binary(message)).await {
-                            Ok(_) => {},
-                            Err(e) => {
-                                stream_liveness.store(false, Ordering::Relaxed);
-                            },
-                        } 
-                    })
-                },
-                |err| eprintln!("errored in input stream {}", err),
-                Some(Duration::from_secs(5))
-            ).unwrap();
+        }
+        println!("dad");
+        
 
-        stream.play().expect("could not start stream for client");
-        Ok(stream)
-    }
-}
-
-#[async_trait]
-impl Client for Metal2RemoteClient {
-    async fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
-        self.device = new_device;
-
-        let config = self.device.default_input_config().expect("could not get default input config!");
-
-        //send new config to server
+        //send first config!
+        let config = self.device.as_ref().expect("tried to connect with no device set").default_input_config().expect("no input config!");
 
         let buffer_size = match config.buffer_size() {
             SupportedBufferSize::Range { min, max } => max.to_owned(),
@@ -125,106 +109,89 @@ impl Client for Metal2RemoteClient {
         };
 
         let bin_config_struct = crate::BinStreamConfig {
-            channels:  config.channels(),
+            channels: config.channels(),
             sample_rate: config.sample_rate().0,
-            buffer_size
-        };
-    
-        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(crate::AliasedData{alias: crate::BinStreamAlias{alias: "N/A".to_owned()}, data: bin_config_struct}))?;
+            buffer_size: buffer_size
+        };  
+
+        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(crate::AliasedData{alias: crate::BinStreamAlias{alias: alias.clone()}, data: bin_config_struct})).expect("could not deserialize!");
+
         {
-            match &mut self.connection {
-                Some(connection) => {
-                    let mut ul_connection = connection.lock().await;
-                    ul_connection.writer.send(Message::binary(bin_config)).await.expect("error sending config!");
-                },
-                None => {}
-            }            
+            let ul_connection = connection.lock().expect("could not get lock on connection!");
+            ul_connection.socket.send(&bin_config).expect("failed to send binconfig!");
+            // sent!
         }
-        // establish new stream
+
+        // neet a mutex here for next step
+        let stream_connection = Arc::clone(&connection);
+
+        // start to send audio!
+        let stream = self.establish_audio_link(alias, config, stream_connection);
+
+        {
+            let mut ul_connection = connection.lock().expect("could not get lock for connection!");
+            ul_connection.stream = Some(Stream{stream});
+        }
+        // started!
+
         
-        let input_stream_connection = Arc::clone(self.connection.as_ref().unwrap());
-        let liveness: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
-        let stream_liveness: Arc<AtomicBool> = Arc::clone(&liveness);
 
-        let stream = ClientHelper::build_input_stream(&self.device, config, input_stream_connection, stream_liveness).expect("could not build input stream!");
 
-        self.stream = Some(Metal2RemoteStream {
-            stream,
-            liveness
-        });
 
+        // let mut buf = [0; 10];
+        // let (amt, src) = socket.recv_from(&mut buf)?;
+
+        // // Redeclare `buf` as slice of the received data and send reverse data back to origin.
+        // let buf = &mut buf[..amt];
+
+        println!("connected!");
         Ok(())
     }
 
+    // must be connected
+    fn change_source_device(&mut self, new_device: cpal::Device) -> Result<(), Box<dyn std::error::Error>> {
 
-
-
-    async fn connect(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
-       
-        // first establish connection
-        let (socket, resp) = connect_async(url).await?;
-        let (mut writer, reader) = socket.split();
-
-        //then send config
-        let config: cpal::SupportedStreamConfig = self.device.default_input_config().expect("could not get default input device!");
-
-
-        let bin_config_struct = crate::BinStreamConfig {
-            channels:  config.channels(),
-            sample_rate: config.sample_rate().0,
-            buffer_size: 4096
-        };
-    
-        let bin_config = bincode::serialize(&crate::BinMessages::BinConfig(crate::AliasedData{alias: crate::BinStreamAlias {alias: "N/A".to_owned()}, data: bin_config_struct}))?;
-    
-        writer.send(Message::binary(bin_config)).await.expect("error sending config!");
-
-        // remember to store connection in self
-        let mut connection = Connection {
-            url: url.to_owned(),
-            writer,
-            reader
-        };
-
-        let self_connection = Arc::new(Mutex::new(connection));
-        let input_stream_connection = Arc::clone(&self_connection);
-
-        self.connection = Some(self_connection);
-
-        let liveness: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
-        let stream_liveness: Arc<AtomicBool> = Arc::clone(&liveness);
-
-        //then set up stream
-        let stream = ClientHelper::build_input_stream(&self.device, config, input_stream_connection, stream_liveness).expect("could not build input stream!");
-
-        self.stream = Some(Metal2RemoteStream {
-            stream,
-            liveness
-        });
-
-        Ok(())
-    }
-
-    async fn is_alive(&mut self) -> bool {
-
-        match &self.stream {
-            Some(stream) => stream.liveness.load(Ordering::Relaxed),
-            None => false
-
+        {
+            let mut ul_connection = self.connection.as_mut().unwrap().lock().expect("could not unlock connection");
+            ul_connection.stream = None;
         }
+        let stream_connection = Arc::clone(self.connection.as_ref().unwrap());
+        
+        let alias = self.name();
+        let stream = self.establish_audio_link(alias, new_device.default_input_config().expect("could not get default input config"), stream_connection);
+        
+        {
+            let mut ul_connection = self.connection.as_mut().unwrap().lock().expect("could not unlock connection");
+            ul_connection.stream = Some(Stream{stream});
+            self.device = Some(new_device);
+        }
+
+        Ok(())
+
     }
 
-    async fn name(&mut self) -> String {
-        let device_name = match self.device.name() {
-            Ok(name) => name,
-            Err(e) => "N/A".to_owned()
-        };
-
-        let url = match &self.connection {
-            Some(connection) => connection.lock().await.url.clone(),
-            None => "N/A".to_owned()
-        };
-
-        format!("{device_name}:{url}")
+    fn is_alive(&mut self) -> bool {
+        let ul_alive = self.is_alive.lock().expect("could not lock client is_alive");
+        return *ul_alive;
     }
+
+    // this locks on connection
+    fn name(&mut self) -> String {
+        let name = match &self.connection {
+            Some(connection) => {
+                let ul_connection = connection.lock().expect("could not lock connection!");
+                let addr = ul_connection.socket.local_addr().expect("could not get peer addr of socket").to_string();
+                format!("{}:{}", addr, self.name)
+            }
+            None => self.name.clone()
+        };
+
+        return name;
+    }
+}
+
+fn main() {
+    let mut client = Client::new("client", cpal::default_host().default_input_device().expect("could not get default input device"));
+    let _ = client.connect("localhost:9000");
+    std::thread::sleep(std::time::Duration::from_secs(3));
 }

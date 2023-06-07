@@ -16,7 +16,7 @@ class Client extends Component {
         super(props);
 
         this.state = {
-            activeClientText: 'ws://0.0.0.0:8000',
+            activeClientText: 'localhost:9000',
         };
     }
 
